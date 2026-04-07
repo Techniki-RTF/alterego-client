@@ -17,10 +17,16 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "exteragram-utils" },
+    { name = "py-androidbuild" },
+    { name = "sc-pylibs" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "exteragram-utils", specifier = "==0.1.3" }]
+requires-dist = [
+    { name = "exteragram-utils", specifier = "==0.1.3" },
+    { name = "py-androidbuild", specifier = ">=0.9" },
+    { name = "sc-pylibs", specifier = ">=0.0.0.1" },
+]
 
 [[package]]
 name = "beautifulsoup4"
@@ -384,6 +390,12 @@ wheels = [
 ]
 
 [[package]]
+name = "py-androidbuild"
+version = "0.9"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c3/e5/dc34c168c994c7143f0f81b731c28005674bce136e03208a69181b84f3fd/py-androidbuild-0.9.tar.gz", hash = "sha256:412ae35929bb8f28beb69c1a76de99e088f610a661c0a5005f2eb55a42afdeab", size = 11134, upload-time = "2011-03-01T15:47:32.101Z" }
+
+[[package]]
 name = "pytokens"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -472,6 +484,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/5f/a4/98b9c7c6428a668bf
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/8e/7540e8a2036f79a125c1d2ebadf69ed7901608859186c856fa0388ef4197/requests-2.33.1-py3-none-any.whl", hash = "sha256:4e6d1ef462f3626a1f0a0a9c42dd93c63bad33f9f1c1937509b8c5c8718ab56a", size = 64947, upload-time = "2026-03-30T16:09:13.83Z" },
 ]
+
+[[package]]
+name = "sc-pylibs"
+version = "0.0.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/d9/cda6fc6ee0dad192432c869be32284784a0f8751dfc1963762dbf433ba2d/sc-pylibs-0.0.0.1.tar.gz", hash = "sha256:b1ac53216a8a09e5f2ef92220a79196a7cf25c63f060207ec48c40d0de90ea95", size = 969, upload-time = "2024-09-09T09:05:14.013Z" }
 
 [[package]]
 name = "soupsieve"

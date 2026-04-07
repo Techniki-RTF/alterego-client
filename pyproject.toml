@@ -4,4 +4,6 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "exteragram-utils==0.1.3",
+    "py-androidbuild>=0.9",
+    "sc-pylibs>=0.0.0.1",
 ]
