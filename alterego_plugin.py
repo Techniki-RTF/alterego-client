@@ -7,11 +7,175 @@ __author__ = "@renamq"
 __icon__ = "exteraPlugins/1"
 # endregion
 
+import time
 from typing import Any, List
+from urllib.parse import urlparse
+
+import requests
 from base_plugin import BasePlugin, MethodHook
+from client_utils import run_on_queue
 from ui.settings import Header, Text, Divider, Input
 from hook_utils import find_class, get_private_field
-from android_utils import run_on_ui_thread
+from android_utils import run_on_ui_thread, OnClickListener
+
+ACTION_DOWN = 0
+ACTION_UP = 1
+ACTION_CANCEL = 3
+LONG_PRESS_DELAY_MS = 430
+STATUS_RETURN_DELAY_MS = 420
+STATUS_REFRESH_INTERVAL_MS = 5000
+
+
+class StatusTouchHelper:
+    # Handles tap and long-press for floating status view.
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._cell_to_chat = {}
+        self._touch_state = {}
+
+    @staticmethod
+    def _view_key(view):
+        try:
+            return int(view.hashCode())
+        except Exception:
+            return str(view)
+
+    @staticmethod
+    def _now_ms():
+        return int(time.time() * 1000)
+
+    def register_cell(self, cell, chat_activity):
+        self._cell_to_chat[self._view_key(cell)] = chat_activity
+
+    def unregister_cell(self, cell):
+        key = self._view_key(cell)
+        if key in self._cell_to_chat:
+            del self._cell_to_chat[key]
+        if key in self._touch_state:
+            del self._touch_state[key]
+
+    def is_status_cell(self, cell):
+        cell_key = self._view_key(cell)
+        chat_activity = self._cell_to_chat.get(cell_key)
+        return chat_activity is not None and not self.plugin._is_native_date_mode(chat_activity)
+
+    def _touch_down(self, cell_key):
+        self.plugin.log(f"[AlterEgo][diag] touch down: {cell_key}")
+        token = self._now_ms()
+        self._touch_state[cell_key] = {"pressed": True, "fired": False, "token": token}
+
+        def _fire_long_press():
+            state = self._touch_state.get(cell_key)
+            if not state or not state.get("pressed") or state.get("fired"):
+                return
+            if state.get("token") != token:
+                return
+
+            chat_activity = self._cell_to_chat.get(cell_key)
+            if chat_activity is None or self.plugin._is_native_date_mode(chat_activity):
+                self.plugin.log("[AlterEgo][diag] long press skipped: no chat or native mode")
+                return
+
+            state["fired"] = True
+            self.plugin.log("[AlterEgo][diag] long press fired")
+            self.plugin._on_status_long_press(chat_activity)
+
+        run_on_ui_thread(_fire_long_press, LONG_PRESS_DELAY_MS)
+
+    def _touch_up(self, cell_key):
+        self.plugin.log(f"[AlterEgo][diag] touch up: {cell_key}")
+        state = self._touch_state.get(cell_key)
+        if state is not None:
+            state["pressed"] = False
+
+    def _is_long_press_fired(self, cell_key):
+        state = self._touch_state.get(cell_key)
+        return bool(state and state.get("fired"))
+
+    def handle_touch(self, cell, event):
+        if event is None:
+            return False
+
+        action = event.getAction()
+        cell_key = self._view_key(cell)
+
+        if action == ACTION_DOWN:
+            self._touch_down(cell_key)
+        elif action == ACTION_UP:
+            if not self._is_long_press_fired(cell_key):
+                chat_activity = self._cell_to_chat.get(cell_key)
+                if chat_activity is not None and not self.plugin._is_native_date_mode(chat_activity):
+                    self.plugin._on_status_tap(chat_activity)
+            self._touch_up(cell_key)
+        elif action == ACTION_CANCEL:
+            self._touch_up(cell_key)
+
+        return True
+
+
+class FloatingDateViewHelper:
+    # Encapsulates floating date view mutations and native listener restore.
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._native_action_click = {}
+
+    def _chat_key(self, chat_activity):
+        return self.plugin._chat_key(chat_activity)
+
+    @staticmethod
+    def _keep_visible(view):
+        if hasattr(view, "setAlpha"):
+            view.setAlpha(1.0)
+        if hasattr(view, "setTag"):
+            view.setTag(1)
+        if hasattr(view, "setVisibility"):
+            view.setVisibility(0)
+
+    def _get_floating_view(self, chat_activity):
+        return get_private_field(chat_activity, "floatingDateView")
+
+    def apply_status_text(self, chat_activity, text):
+        if chat_activity is None:
+            return None
+
+        floating_date_view = self._get_floating_view(chat_activity)
+        if floating_date_view is None:
+            return None
+
+        chat_key = self._chat_key(chat_activity)
+        if chat_key not in self._native_action_click:
+            self._native_action_click[chat_key] = get_private_field(floating_date_view, "onActionClick")
+
+        if hasattr(floating_date_view, "setCustomText"):
+            floating_date_view.setCustomText(text)
+
+        if hasattr(floating_date_view, "setOnActionClickListener"):
+            floating_date_view.setOnActionClickListener(OnClickListener(lambda view: None))
+
+        self._keep_visible(floating_date_view)
+        return floating_date_view
+
+    def restore_native_date(self, chat_activity):
+        if chat_activity is None:
+            return None
+
+        floating_date_view = self._get_floating_view(chat_activity)
+        if floating_date_view is None:
+            return None
+
+        if hasattr(floating_date_view, "getCustomDate") and hasattr(floating_date_view, "setCustomDate"):
+            current_date = floating_date_view.getCustomDate()
+            if current_date:
+                floating_date_view.setCustomDate(0, False, False)
+                floating_date_view.setCustomDate(current_date, False, False)
+
+        chat_key = self._chat_key(chat_activity)
+        original_listener = self._native_action_click.get(chat_key)
+        if original_listener is not None and hasattr(floating_date_view, "setOnActionClickListener"):
+            floating_date_view.setOnActionClickListener(original_listener)
+
+        self._keep_visible(floating_date_view)
+        return floating_date_view
 
 
 class ChatCreateViewHook(MethodHook):
@@ -50,6 +214,8 @@ class ChatHideFloatingDateHook(MethodHook):
 
     def before_hooked_method(self, param):
         try:
+            # Keep floating view always visible. In native mode we keep native date text,
+            # in status mode we keep custom plugin text.
             if self.plugin._is_native_date_mode(param.thisObject):
                 self.plugin._restore_native_floating_date(param.thisObject)
                 param.setResult(None)
@@ -61,16 +227,41 @@ class ChatHideFloatingDateHook(MethodHook):
             self.plugin.log(f"[AlterEgo] Failed to keep floating date visible: {error}")
 
 
+class FloatingDateTouchHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            if not self.plugin._status_touch.is_status_cell(cell):
+                return
+
+            event = param.args[0] if param.args and len(param.args) > 0 else None
+            if self.plugin._status_touch.handle_touch(cell, event):
+                param.setResult(True)
+        except Exception as error:
+            self.plugin.log(f"[AlterEgo] FloatingDate touch hook failed: {error}")
+
+
 # endregion
 
+
 class AlterEgo(BasePlugin):
+    # region Lifecycle
     def __init__(self):
         super().__init__()
         self._chat_create_view_unhooks = []
         self._chat_show_floating_date_unhooks = []
         self._chat_hide_floating_date_unhooks = []
+        self._chat_action_touch_unhooks = []
         self._native_date_mode = {}
         self._last_scroll_activity_ms = {}
+        self._status_cache = "API Unavailable"
+        self._status_cache_at_ms = 0
+        self._status_refresh_in_flight = False
+        self._status_touch = StatusTouchHelper(self)
+        self._floating_view = FloatingDateViewHelper(self)
 
     def on_plugin_load(self):
         try:
@@ -100,25 +291,107 @@ class AlterEgo(BasePlugin):
                 priority=80,
             ) or []
 
+            chat_action_cell_class = find_class("org.telegram.ui.Cells.ChatActionCell")
+            if chat_action_cell_class:
+                self._chat_action_touch_unhooks = self.hook_all_methods(
+                    chat_action_cell_class,
+                    "onTouchEvent",
+                    FloatingDateTouchHook(self),
+                    priority=100,
+                ) or []
+
             self.log(
                 f"[AlterEgo] Hooks active: createView={len(self._chat_create_view_unhooks)}, "
                 f"showFloatingDateView={len(self._chat_show_floating_date_unhooks)}, "
-                f"hideFloatingDateView={len(self._chat_hide_floating_date_unhooks)}"
+                f"hideFloatingDateView={len(self._chat_hide_floating_date_unhooks)}, "
+                f"chatActionTouch={len(self._chat_action_touch_unhooks)}"
             )
         except Exception as error:
             self.log(f"[AlterEgo] Hook setup failed: {error}")
+    # endregion
 
-    def _status(self):
-        api_key = self.get_setting("api_key", "")
-        if isinstance(api_key, str) and api_key.strip():
-            return "Connected"
+    # region Status text
+    def _status(self, chat_activity=None):
+        now = self._now_ms()
+        if now - self._status_cache_at_ms >= STATUS_REFRESH_INTERVAL_MS:
+            self._refresh_status_async(chat_activity)
+        return self._status_cache
+
+    def _compute_status_sync(self):
+        api_url = self.get_setting("api_url", "").strip()
+        if not isinstance(api_url, str) or not api_url:
+            return "API Unavailable"
+
+        if not self._is_url(api_url):
+            return "Invalid URL"
+
+        try:
+            normalized = api_url.rstrip("/")
+            response = requests.get(f"{normalized}/api/Status", timeout=2)
+            if response.status_code == 200:
+                return "Connected"
+        except Exception:
+            return "API Unavailable"
+
         return "API Unavailable"
 
-    def _chat_key(self, chat_activity):
-        return str(chat_activity)
+    def _refresh_status_async(self, chat_activity=None):
+        if self._status_refresh_in_flight:
+            return
 
-    def _now_ms(self):
-        import time
+        self._status_refresh_in_flight = True
+
+        def _worker():
+            new_status = self._compute_status_sync()
+
+            def _apply():
+                self._status_cache = new_status
+                self._status_cache_at_ms = self._now_ms()
+                self._status_refresh_in_flight = False
+                if chat_activity is not None and not self._is_native_date_mode(chat_activity):
+                    self._apply_floating_date_status(chat_activity)
+
+            run_on_ui_thread(_apply)
+
+        def _worker_safe():
+            try:
+                _worker()
+            except Exception:
+                def _reset():
+                    self._status_refresh_in_flight = False
+                    self._status_cache_at_ms = self._now_ms()
+                run_on_ui_thread(_reset)
+
+        run_on_queue(_worker_safe)
+
+    @staticmethod
+    def _is_url(url):
+        try:
+            result = urlparse(url)
+            return all([result.scheme, result.netloc])
+        except ValueError:
+            return False
+
+    def _status_banner_text(self, chat_activity=None):
+        # User-defined text has priority over computed status text.
+        custom_text = self.get_setting("status_text", "")
+        if isinstance(custom_text, str):
+            custom_text = custom_text.strip()
+            if custom_text:
+                return custom_text
+        return f"Alter Ego - {self._status(chat_activity)}"
+    # endregion
+
+    # region Helpers
+    @staticmethod
+    def _chat_key(chat_activity):
+        try:
+            return int(chat_activity.hashCode())
+        except Exception:
+            return str(chat_activity)
+
+    @staticmethod
+    def _now_ms():
         return int(time.time() * 1000)
 
     def _set_native_date_mode(self, chat_activity, value):
@@ -130,7 +403,23 @@ class AlterEgo(BasePlugin):
         if chat_activity is None:
             return False
         return bool(self._native_date_mode.get(self._chat_key(chat_activity), False))
+    # endregion
 
+    # region Interaction callbacks
+    def _on_status_tap(self, chat_activity):
+        if chat_activity is None:
+            return
+
+    def _on_status_long_press(self, chat_activity):
+        if chat_activity is None:
+            self.log("[AlterEgo][diag] long press handler: chat is None")
+            return
+
+        self.log("[AlterEgo][diag] long press handler: opening plugin settings")
+        self._open_plugin_settings()
+    # endregion
+
+    # region Floating date flow
     def _mark_scroll_activity(self, chat_activity):
         if chat_activity is None:
             return
@@ -141,25 +430,40 @@ class AlterEgo(BasePlugin):
         if chat_activity is None:
             return
 
-        floating_date_view = get_private_field(chat_activity, "floatingDateView")
+        floating_date_view = self._floating_view.apply_status_text(chat_activity, self._status_banner_text(chat_activity))
         if floating_date_view is None:
             return
 
-        status_text = self._status()
-        final_text = f"Alter Ego - {status_text}"
+        self._status_touch.register_cell(floating_date_view, chat_activity)
 
-        if hasattr(floating_date_view, "setCustomText"):
-            floating_date_view.setCustomText(final_text)
+    # region Plugin settings navigation
+    def _open_plugin_settings(self):
+        plugin_id = self.id if getattr(self, "id", None) else __id__
+        plugins_controller_class = find_class("com.exteragram.messenger.plugins.PluginsController")
+        if not plugins_controller_class:
+            self.log("[AlterEgo] PluginsController class not found")
+            return
 
-        if hasattr(floating_date_view, "setAlpha"):
-            floating_date_view.setAlpha(1.0)
+        controller = None
+        for args in ((), (0,)):
+            try:
+                controller = plugins_controller_class.getInstance(*args)
+                if controller is not None:
+                    break
+            except Exception:
+                continue
 
-        if hasattr(floating_date_view, "setTag"):
-            floating_date_view.setTag(1)
+        if controller is None:
+            self.log("[AlterEgo] PluginsController instance not found")
+            return
 
-        if hasattr(floating_date_view, "setVisibility"):
-            floating_date_view.setVisibility(0)
+        try:
+            controller.openPluginSettings(plugin_id)
+        except Exception as error:
+            self.log(f"[AlterEgo] Failed to open plugin settings: {error}")
+    # endregion
 
+    # region Timers
     def _schedule_auto_status_return(self, chat_activity):
         if chat_activity is None:
             return
@@ -176,32 +480,21 @@ class AlterEgo(BasePlugin):
             self._set_native_date_mode(chat_activity, False)
             self._apply_floating_date_status(chat_activity)
 
-        run_on_ui_thread(_restore_if_idle, 420)
+        run_on_ui_thread(_restore_if_idle, STATUS_RETURN_DELAY_MS)
+    # endregion
 
+    # region Native date restore
     def _restore_native_floating_date(self, chat_activity):
         if chat_activity is None:
             return
 
-        floating_date_view = get_private_field(chat_activity, "floatingDateView")
+        floating_date_view = self._floating_view.restore_native_date(chat_activity)
         if floating_date_view is None:
             return
 
-        if not hasattr(floating_date_view, "getCustomDate") or not hasattr(floating_date_view, "setCustomDate"):
-            return
-
-        current_date = floating_date_view.getCustomDate()
-        if not current_date:
-            return
-
-        floating_date_view.setCustomDate(0, False, False)
-        floating_date_view.setCustomDate(current_date, False, False)
-
-        if hasattr(floating_date_view, "setAlpha"):
-            floating_date_view.setAlpha(1.0)
-        if hasattr(floating_date_view, "setTag"):
-            floating_date_view.setTag(1)
-        if hasattr(floating_date_view, "setVisibility"):
-            floating_date_view.setVisibility(0)
+        self._status_touch.unregister_cell(floating_date_view)
+    # endregion
+    # endregion
 
     # region Settings
     def create_settings(self) -> List[Any]:
@@ -211,15 +504,15 @@ class AlterEgo(BasePlugin):
             Text(text="Online", accent=True, icon="msg_info_solar"),
             Divider(text="Настройки"),
             Input(
-                key="api_key",
-                text="Ключ API",
+                key="api_url",
+                text="API URL",
                 default="",
                 icon="ai_chat_solar"
             ),
-            Input(
-                key="context_manage",
-                text="Управление контекстом",
-                icon="menu_storage_path_solar"
-            )
+            # Input(
+            #     key="context_manage",
+            #     text="Управление контекстом",
+            #     icon="menu_storage_path_solar"
+            # )
         ]
     # endregion
