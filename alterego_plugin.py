@@ -8,12 +8,15 @@ __icon__ = "exteraPlugins/1"
 # endregion
 
 import time
+import traceback
+from datetime import datetime, timezone
 from typing import Any, List
 from urllib.parse import urlparse
 
 import requests
 from base_plugin import BasePlugin, MethodHook
 from client_utils import run_on_queue
+from ui.bulletin import BulletinHelper
 from ui.settings import Header, Text, Divider, Input
 from hook_utils import find_class, get_private_field
 from android_utils import run_on_ui_thread, OnClickListener
@@ -57,7 +60,9 @@ class StatusTouchHelper:
     def is_status_cell(self, cell):
         cell_key = self._view_key(cell)
         chat_activity = self._cell_to_chat.get(cell_key)
-        return chat_activity is not None and not self.plugin._is_native_date_mode(chat_activity)
+        return chat_activity is not None and not self.plugin._is_native_date_mode(
+            chat_activity
+        )
 
     def _touch_down(self, cell_key):
         self.plugin.log(f"[AlterEgo][diag] touch down: {cell_key}")
@@ -73,7 +78,9 @@ class StatusTouchHelper:
 
             chat_activity = self._cell_to_chat.get(cell_key)
             if chat_activity is None or self.plugin._is_native_date_mode(chat_activity):
-                self.plugin.log("[AlterEgo][diag] long press skipped: no chat or native mode")
+                self.plugin.log(
+                    "[AlterEgo][diag] long press skipped: no chat or native mode"
+                )
                 return
 
             state["fired"] = True
@@ -104,7 +111,9 @@ class StatusTouchHelper:
         elif action == ACTION_UP:
             if not self._is_long_press_fired(cell_key):
                 chat_activity = self._cell_to_chat.get(cell_key)
-                if chat_activity is not None and not self.plugin._is_native_date_mode(chat_activity):
+                if chat_activity is not None and not self.plugin._is_native_date_mode(
+                    chat_activity
+                ):
                     self.plugin._on_status_tap(chat_activity)
             self._touch_up(cell_key)
         elif action == ACTION_CANCEL:
@@ -144,13 +153,17 @@ class FloatingDateViewHelper:
 
         chat_key = self._chat_key(chat_activity)
         if chat_key not in self._native_action_click:
-            self._native_action_click[chat_key] = get_private_field(floating_date_view, "onActionClick")
+            self._native_action_click[chat_key] = get_private_field(
+                floating_date_view, "onActionClick"
+            )
 
         if hasattr(floating_date_view, "setCustomText"):
             floating_date_view.setCustomText(text)
 
         if hasattr(floating_date_view, "setOnActionClickListener"):
-            floating_date_view.setOnActionClickListener(OnClickListener(lambda view: None))
+            floating_date_view.setOnActionClickListener(
+                OnClickListener(lambda view: None)
+            )
 
         self._keep_visible(floating_date_view)
         return floating_date_view
@@ -163,7 +176,9 @@ class FloatingDateViewHelper:
         if floating_date_view is None:
             return None
 
-        if hasattr(floating_date_view, "getCustomDate") and hasattr(floating_date_view, "setCustomDate"):
+        if hasattr(floating_date_view, "getCustomDate") and hasattr(
+            floating_date_view, "setCustomDate"
+        ):
             current_date = floating_date_view.getCustomDate()
             if current_date:
                 floating_date_view.setCustomDate(0, False, False)
@@ -171,7 +186,9 @@ class FloatingDateViewHelper:
 
         chat_key = self._chat_key(chat_activity)
         original_listener = self._native_action_click.get(chat_key)
-        if original_listener is not None and hasattr(floating_date_view, "setOnActionClickListener"):
+        if original_listener is not None and hasattr(
+            floating_date_view, "setOnActionClickListener"
+        ):
             floating_date_view.setOnActionClickListener(original_listener)
 
         self._keep_visible(floating_date_view)
@@ -186,7 +203,9 @@ class ChatCreateViewHook(MethodHook):
         try:
             self.plugin._apply_floating_date_status(param.thisObject)
         except Exception as error:
-            self.plugin.log(f"[AlterEgo] Failed to apply floating date status on createView: {error}")
+            self.plugin.log(
+                f"[AlterEgo] Failed to apply floating date status on createView: {error}"
+            )
 
 
 class ChatShowFloatingDateHook(MethodHook):
@@ -195,7 +214,9 @@ class ChatShowFloatingDateHook(MethodHook):
 
     def after_hooked_method(self, param):
         try:
-            is_scroll = bool(param.args[0]) if param.args and len(param.args) > 0 else False
+            is_scroll = (
+                bool(param.args[0]) if param.args and len(param.args) > 0 else False
+            )
             if is_scroll:
                 self.plugin._set_native_date_mode(param.thisObject, True)
                 self.plugin._mark_scroll_activity(param.thisObject)
@@ -205,7 +226,9 @@ class ChatShowFloatingDateHook(MethodHook):
                 self.plugin._set_native_date_mode(param.thisObject, False)
                 self.plugin._apply_floating_date_status(param.thisObject)
         except Exception as error:
-            self.plugin.log(f"[AlterEgo] Failed to apply floating date status on show: {error}")
+            self.plugin.log(
+                f"[AlterEgo] Failed to apply floating date status on show: {error}"
+            )
 
 
 class ChatHideFloatingDateHook(MethodHook):
@@ -260,6 +283,10 @@ class AlterEgo(BasePlugin):
         self._status_cache = "API Unavailable"
         self._status_cache_at_ms = 0
         self._status_refresh_in_flight = False
+        self._auth_access_token = ""
+        self._auth_refresh_token = ""
+        self._auth_expires_at_ms = 0
+        self._auth_feedback = ""
         self._status_touch = StatusTouchHelper(self)
         self._floating_view = FloatingDateViewHelper(self)
 
@@ -270,35 +297,47 @@ class AlterEgo(BasePlugin):
                 self.log("[AlterEgo] ChatActivity class not found")
                 return
 
-            self._chat_create_view_unhooks = self.hook_all_methods(
-                chat_activity_class,
-                "createView",
-                ChatCreateViewHook(self),
-                priority=80,
-            ) or []
+            self._chat_create_view_unhooks = (
+                self.hook_all_methods(
+                    chat_activity_class,
+                    "createView",
+                    ChatCreateViewHook(self),
+                    priority=80,
+                )
+                or []
+            )
 
-            self._chat_show_floating_date_unhooks = self.hook_all_methods(
-                chat_activity_class,
-                "showFloatingDateView",
-                ChatShowFloatingDateHook(self),
-                priority=90,
-            ) or []
+            self._chat_show_floating_date_unhooks = (
+                self.hook_all_methods(
+                    chat_activity_class,
+                    "showFloatingDateView",
+                    ChatShowFloatingDateHook(self),
+                    priority=90,
+                )
+                or []
+            )
 
-            self._chat_hide_floating_date_unhooks = self.hook_all_methods(
-                chat_activity_class,
-                "hideFloatingDateView",
-                ChatHideFloatingDateHook(self),
-                priority=80,
-            ) or []
+            self._chat_hide_floating_date_unhooks = (
+                self.hook_all_methods(
+                    chat_activity_class,
+                    "hideFloatingDateView",
+                    ChatHideFloatingDateHook(self),
+                    priority=80,
+                )
+                or []
+            )
 
             chat_action_cell_class = find_class("org.telegram.ui.Cells.ChatActionCell")
             if chat_action_cell_class:
-                self._chat_action_touch_unhooks = self.hook_all_methods(
-                    chat_action_cell_class,
-                    "onTouchEvent",
-                    FloatingDateTouchHook(self),
-                    priority=100,
-                ) or []
+                self._chat_action_touch_unhooks = (
+                    self.hook_all_methods(
+                        chat_action_cell_class,
+                        "onTouchEvent",
+                        FloatingDateTouchHook(self),
+                        priority=100,
+                    )
+                    or []
+                )
 
             self.log(
                 f"[AlterEgo] Hooks active: createView={len(self._chat_create_view_unhooks)}, "
@@ -308,6 +347,8 @@ class AlterEgo(BasePlugin):
             )
         except Exception as error:
             self.log(f"[AlterEgo] Hook setup failed: {error}")
+            self.log(f"[AlterEgo] Hook setup traceback: {traceback.format_exc()}")
+
     # endregion
 
     # region Status text
@@ -327,9 +368,23 @@ class AlterEgo(BasePlugin):
 
         try:
             normalized = api_url.rstrip("/")
-            response = requests.get(f"{normalized}/api/Status", timeout=2)
+            headers = self._auth_headers(normalized)
+            response = requests.get(
+                f"{normalized}/api/Status", timeout=2, headers=headers
+            )
             if response.status_code == 200:
                 return "Connected"
+            if response.status_code == 401:
+                if self._login_sync(normalized):
+                    retry_headers = self._auth_headers(normalized)
+                    retry_response = requests.get(
+                        f"{normalized}/api/Status", timeout=2, headers=retry_headers
+                    )
+                    if retry_response.status_code == 200:
+                        return "Connected"
+                if self._has_auth_credentials():
+                    return "Unauthorized"
+                return "Auth Required"
         except Exception:
             return "API Unavailable"
 
@@ -348,7 +403,9 @@ class AlterEgo(BasePlugin):
                 self._status_cache = new_status
                 self._status_cache_at_ms = self._now_ms()
                 self._status_refresh_in_flight = False
-                if chat_activity is not None and not self._is_native_date_mode(chat_activity):
+                if chat_activity is not None and not self._is_native_date_mode(
+                    chat_activity
+                ):
                     self._apply_floating_date_status(chat_activity)
 
             run_on_ui_thread(_apply)
@@ -357,9 +414,11 @@ class AlterEgo(BasePlugin):
             try:
                 _worker()
             except Exception:
+
                 def _reset():
                     self._status_refresh_in_flight = False
                     self._status_cache_at_ms = self._now_ms()
+
                 run_on_ui_thread(_reset)
 
         run_on_queue(_worker_safe)
@@ -372,6 +431,152 @@ class AlterEgo(BasePlugin):
         except ValueError:
             return False
 
+    @staticmethod
+    def _parse_datetime_to_ms(value):
+        if not isinstance(value, str) or not value.strip():
+            return 0
+
+        try:
+            normalized = value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1000)
+        except Exception:
+            return 0
+
+    def _has_auth_credentials(self):
+        username = self.get_setting("auth_username", "")
+        password = self.get_setting("auth_password", "")
+        return (
+            isinstance(username, str)
+            and bool(username.strip())
+            and isinstance(password, str)
+            and bool(password.strip())
+        )
+
+    def _login_sync(self, api_base_url):
+        username = self.get_setting("auth_username", "")
+        password = self.get_setting("auth_password", "")
+        if not isinstance(username, str) or not isinstance(password, str):
+            return False
+
+        username = username.strip()
+        password = password.strip()
+        if not username or not password:
+            return False
+
+        success, _message = self._login_with_credentials_sync(
+            api_base_url, username, password
+        )
+        return success
+
+    @staticmethod
+    def _extract_server_message(response, fallback):
+        if response is None:
+            return fallback
+
+        try:
+            payload = response.json() if response.content else {}
+            if isinstance(payload, dict):
+                for key in ("message", "detail", "title"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+        except Exception:
+            pass
+
+        try:
+            text = response.text.strip() if isinstance(response.text, str) else ""
+            if text:
+                return text[:200]
+        except Exception:
+            pass
+
+        return fallback
+
+    def _login_with_credentials_sync(self, api_base_url, username, password):
+        try:
+            response = requests.post(
+                f"{api_base_url}/api/Auth/login",
+                json={"username": username, "password": password},
+                timeout=3,
+            )
+        except Exception:
+            return False, "Сервер недоступен"
+
+        if response.status_code != 200:
+            message = self._extract_server_message(response, "Ошибка авторизации")
+            return False, message
+
+        try:
+            payload = response.json() if response.content else {}
+        except Exception:
+            return False, "Некорректный ответ сервера"
+
+        access_token = payload.get("accessToken") if isinstance(payload, dict) else None
+        refresh_token = (
+            payload.get("refreshToken") if isinstance(payload, dict) else None
+        )
+        expires_at = payload.get("expiresAt") if isinstance(payload, dict) else None
+        if not isinstance(access_token, str) or not access_token.strip():
+            return False, "Токен не получен"
+
+        self._auth_access_token = access_token.strip()
+        self._auth_refresh_token = (
+            refresh_token.strip() if isinstance(refresh_token, str) else ""
+        )
+        self._auth_expires_at_ms = self._parse_datetime_to_ms(expires_at)
+        self.set_setting("auth_session_user", username, reload_settings=True)
+        return True, "Вход выполнен"
+
+    def _refresh_token_sync(self, api_base_url):
+        if not self._auth_refresh_token:
+            return False
+
+        try:
+            response = requests.post(
+                f"{api_base_url}/api/Auth/refresh",
+                json={"refreshToken": self._auth_refresh_token},
+                timeout=3,
+            )
+            if response.status_code != 200:
+                return False
+
+            payload = response.json() if response.content else {}
+            access_token = (
+                payload.get("accessToken") if isinstance(payload, dict) else None
+            )
+            refresh_token = (
+                payload.get("refreshToken") if isinstance(payload, dict) else None
+            )
+            expires_at = payload.get("expiresAt") if isinstance(payload, dict) else None
+            if not isinstance(access_token, str) or not access_token.strip():
+                return False
+
+            self._auth_access_token = access_token.strip()
+            if isinstance(refresh_token, str) and refresh_token.strip():
+                self._auth_refresh_token = refresh_token.strip()
+            self._auth_expires_at_ms = self._parse_datetime_to_ms(expires_at)
+            return True
+        except Exception:
+            return False
+
+    def _auth_headers(self, api_base_url):
+        now = self._now_ms()
+        expires_soon = (
+            self._auth_expires_at_ms > 0 and self._auth_expires_at_ms - now <= 15000
+        )
+
+        if not self._auth_access_token or expires_soon:
+            if not self._refresh_token_sync(api_base_url):
+                self._login_sync(api_base_url)
+
+        if not self._auth_access_token:
+            return {}
+
+        return {"Authorization": f"Bearer {self._auth_access_token}"}
+
     def _status_banner_text(self, chat_activity=None):
         # User-defined text has priority over computed status text.
         custom_text = self.get_setting("status_text", "")
@@ -380,6 +585,24 @@ class AlterEgo(BasePlugin):
             if custom_text:
                 return custom_text
         return f"Alter Ego - {self._status(chat_activity)}"
+
+    def _auth_status_text(self):
+        session_user = self.get_setting("auth_session_user", "")
+        if self._auth_access_token:
+            return f"Вы вошли как {self._auth_username_text()}"
+        if isinstance(session_user, str) and session_user.strip():
+            return f"Вы вошли как {session_user.strip()}"
+        return "Вход не выполнен"
+
+    def _auth_menu_text(self):
+        return self._auth_status_text()
+
+    def _auth_username_text(self):
+        username = self.get_setting("auth_username", "")
+        if isinstance(username, str) and username.strip():
+            return username.strip()
+        return "пользователь"
+
     # endregion
 
     # region Helpers
@@ -403,6 +626,7 @@ class AlterEgo(BasePlugin):
         if chat_activity is None:
             return False
         return bool(self._native_date_mode.get(self._chat_key(chat_activity), False))
+
     # endregion
 
     # region Interaction callbacks
@@ -417,6 +641,147 @@ class AlterEgo(BasePlugin):
 
         self.log("[AlterEgo][diag] long press handler: opening plugin settings")
         self._open_plugin_settings()
+
+    def _create_auth_sub_fragment(self):
+        items = [Header(text="Вход в Alter Ego API")]
+
+        if self._auth_access_token:
+            items.append(
+                Text(text=f"Логин: {self._auth_username_text()}", icon="user_solar")
+            )
+            items.append(Text(text="Пароль: ********", icon="lock_password"))
+            items.append(
+                Text(
+                    text="Выйти",
+                    red=True,
+                    icon="cross_circle_solar",
+                    on_click=self._logout_from_auth_page,
+                )
+            )
+            return items
+
+        items.append(
+            Input(
+                key="auth_username",
+                text="Логин",
+                default=self.get_setting("auth_username", ""),
+                icon="user_solar",
+            )
+        )
+        items.append(
+            Input(
+                key="auth_password",
+                text="Пароль",
+                default=self.get_setting("auth_password", ""),
+                icon="lock_password",
+            )
+        )
+        items.append(
+            Text(
+                text="Войти",
+                accent=True,
+                icon="msg_send_solar",
+                on_click=self._login_from_auth_page,
+            )
+        )
+
+        return items
+
+    def _show_bulletin(self, message, kind="info"):
+        if not isinstance(message, str) or not message.strip():
+            return
+
+        def _show():
+            try:
+                fragment = get_last_fragment()
+                if kind == "success":
+                    BulletinHelper.show_success(message, fragment)
+                elif kind == "error":
+                    BulletinHelper.show_error(message, fragment)
+                else:
+                    BulletinHelper.show_info(message, fragment)
+            except Exception as error:
+                self.log(f"[AlterEgo] Bulletin failed: {error}")
+
+        run_on_ui_thread(_show)
+
+    def _login_from_auth_page(self, _view=None):
+        api_url = self.get_setting("api_url", "")
+        username = self.get_setting("auth_username", "")
+        password = self.get_setting("auth_password", "")
+
+        username = username.strip() if isinstance(username, str) else ""
+        password = password.strip() if isinstance(password, str) else ""
+        if not isinstance(api_url, str) or not self._is_url(api_url):
+            self._auth_feedback = "Некорректный API URL"
+            self._show_bulletin(self._auth_feedback, "error")
+            return
+        if not username or not password:
+            self._auth_feedback = "Заполните логин и пароль"
+            self._show_bulletin(self._auth_feedback, "error")
+            return
+
+        self.set_setting("auth_username", username)
+        self.set_setting("auth_password", password)
+        self._auth_feedback = "Вход..."
+        self._show_bulletin("Вход...", "info")
+        normalized = api_url.rstrip("/")
+
+        def _worker():
+            success, message = self._login_with_credentials_sync(
+                normalized, username, password
+            )
+
+            def _apply():
+                self._auth_feedback = message
+                self._status_cache = "Connected" if success else "Unauthorized"
+                self._status_cache_at_ms = self._now_ms()
+                self._show_bulletin(message, "success" if success else "error")
+                if success:
+                    self._open_plugin_settings()
+
+            run_on_ui_thread(_apply)
+
+        run_on_queue(_worker)
+
+    def _logout_from_auth_page(self, _view=None):
+        api_url = self.get_setting("api_url", "")
+        normalized = api_url.rstrip("/") if isinstance(api_url, str) else ""
+        self._auth_feedback = "Выход..."
+        self._show_bulletin("Выход...", "info")
+
+        def _worker():
+            try:
+                if (
+                    normalized
+                    and self._is_url(normalized)
+                    and isinstance(self._auth_access_token, str)
+                    and self._auth_access_token
+                ):
+                    requests.post(
+                        f"{normalized}/api/Auth/logout",
+                        timeout=2,
+                        headers={"Authorization": f"Bearer {self._auth_access_token}"},
+                    )
+            except Exception:
+                pass
+
+            self._auth_access_token = ""
+            self._auth_refresh_token = ""
+            self._auth_expires_at_ms = 0
+            self.set_setting("auth_session_user", "", reload_settings=True)
+            self._status_cache = "Auth Required"
+            self._status_cache_at_ms = self._now_ms()
+            self._auth_feedback = "Выход выполнен"
+
+            def _apply():
+                self._show_bulletin("Выход выполнен", "success")
+                self._open_plugin_settings()
+
+            run_on_ui_thread(_apply)
+
+        run_on_queue(_worker)
+
     # endregion
 
     # region Floating date flow
@@ -430,7 +795,9 @@ class AlterEgo(BasePlugin):
         if chat_activity is None:
             return
 
-        floating_date_view = self._floating_view.apply_status_text(chat_activity, self._status_banner_text(chat_activity))
+        floating_date_view = self._floating_view.apply_status_text(
+            chat_activity, self._status_banner_text(chat_activity)
+        )
         if floating_date_view is None:
             return
 
@@ -439,7 +806,9 @@ class AlterEgo(BasePlugin):
     # region Plugin settings navigation
     def _open_plugin_settings(self):
         plugin_id = self.id if getattr(self, "id", None) else __id__
-        plugins_controller_class = find_class("com.exteragram.messenger.plugins.PluginsController")
+        plugins_controller_class = find_class(
+            "com.exteragram.messenger.plugins.PluginsController"
+        )
         if not plugins_controller_class:
             self.log("[AlterEgo] PluginsController class not found")
             return
@@ -461,6 +830,7 @@ class AlterEgo(BasePlugin):
             controller.openPluginSettings(plugin_id)
         except Exception as error:
             self.log(f"[AlterEgo] Failed to open plugin settings: {error}")
+
     # endregion
 
     # region Timers
@@ -481,6 +851,7 @@ class AlterEgo(BasePlugin):
             self._apply_floating_date_status(chat_activity)
 
         run_on_ui_thread(_restore_if_idle, STATUS_RETURN_DELAY_MS)
+
     # endregion
 
     # region Native date restore
@@ -493,6 +864,7 @@ class AlterEgo(BasePlugin):
             return
 
         self._status_touch.unregister_cell(floating_date_view)
+
     # endregion
     # endregion
 
@@ -501,18 +873,14 @@ class AlterEgo(BasePlugin):
         return [
             Header(text="Настройки AlterEgo"),
             Divider(text="Статус"),
-            Text(text="Online", accent=True, icon="msg_info_solar"),
-            Divider(text="Настройки"),
-            Input(
-                key="api_url",
-                text="API URL",
-                default="",
-                icon="ai_chat_solar"
+            Text(
+                text=self._auth_menu_text(),
+                accent=True,
+                icon="msg_info_solar",
+                create_sub_fragment=self._create_auth_sub_fragment,
             ),
-            # Input(
-            #     key="context_manage",
-            #     text="Управление контекстом",
-            #     icon="menu_storage_path_solar"
-            # )
+            Divider(text="Настройки"),
+            Input(key="api_url", text="API URL", default="", icon="ai_chat_solar"),
         ]
+
     # endregion
