@@ -7,19 +7,21 @@ __author__ = "@renamq"
 __icon__ = "exteraPlugins/1"
 # endregion
 
+import threading
 import time
 import traceback
+from java import jclass
 from datetime import datetime, timezone
 from typing import Any, List
 from urllib.parse import urlparse
 
 import requests
-from base_plugin import BasePlugin, MethodHook
-from client_utils import run_on_queue
+from android_utils import run_on_ui_thread, OnClickListener
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from client_utils import run_on_queue, get_last_fragment
+from hook_utils import find_class, get_private_field, set_private_field
 from ui.bulletin import BulletinHelper
 from ui.settings import Header, Text, Divider, Input
-from hook_utils import find_class, get_private_field
-from android_utils import run_on_ui_thread, OnClickListener
 
 ACTION_DOWN = 0
 ACTION_UP = 1
@@ -27,6 +29,7 @@ ACTION_CANCEL = 3
 LONG_PRESS_DELAY_MS = 430
 STATUS_RETURN_DELAY_MS = 420
 STATUS_REFRESH_INTERVAL_MS = 5000
+LLM_TIMEOUT_SEC = 15
 
 
 class StatusTouchHelper:
@@ -287,6 +290,9 @@ class AlterEgo(BasePlugin):
         self._auth_refresh_token = ""
         self._auth_expires_at_ms = 0
         self._auth_feedback = ""
+        self._send_hook_registered = False
+        self._mask_cache = {}
+        self._bypass_text_counts = {}
         self._status_touch = StatusTouchHelper(self)
         self._floating_view = FloatingDateViewHelper(self)
 
@@ -345,6 +351,14 @@ class AlterEgo(BasePlugin):
                 f"hideFloatingDateView={len(self._chat_hide_floating_date_unhooks)}, "
                 f"chatActionTouch={len(self._chat_action_touch_unhooks)}"
             )
+
+            try:
+                self.add_on_send_message_hook(priority=90)
+                self._send_hook_registered = True
+                self.log("[AlterEgo] Send pipeline hook registered")
+            except Exception as error:
+                self.log(f"[AlterEgo] Send pipeline hook failed: {error}")
+
         except Exception as error:
             self.log(f"[AlterEgo] Hook setup failed: {error}")
             self.log(f"[AlterEgo] Hook setup traceback: {traceback.format_exc()}")
@@ -479,6 +493,16 @@ class AlterEgo(BasePlugin):
         try:
             payload = response.json() if response.content else {}
             if isinstance(payload, dict):
+                errors = payload.get("errors")
+                if isinstance(errors, dict) and errors:
+                    parts = []
+                    for field, msgs in errors.items():
+                        if isinstance(msgs, list) and msgs:
+                            parts.append(f"{field}: {msgs[0]}")
+                        elif isinstance(msgs, str) and msgs.strip():
+                            parts.append(f"{field}: {msgs.strip()}")
+                    if parts:
+                        return "; ".join(parts[:4])
                 for key in ("message", "detail", "title"):
                     value = payload.get(key)
                     if isinstance(value, str) and value.strip():
@@ -576,6 +600,300 @@ class AlterEgo(BasePlugin):
             return {}
 
         return {"Authorization": f"Bearer {self._auth_access_token}"}
+
+    def _call_llm_mask_sync(self, api_base_url, source_text, chat_context=""):
+        headers = self._auth_headers(api_base_url)
+        payload = {"message": source_text}
+        self.log(
+            f"[AlterEgo] llm request: payload={{message}}, text_len={len(source_text)}, has_auth={bool(headers.get('Authorization'))}"
+        )
+
+        try:
+            response = requests.post(
+                f"{api_base_url}/api/Llm/generate",
+                json=payload,
+                headers=headers,
+                timeout=LLM_TIMEOUT_SEC,
+            )
+        except Exception as error:
+            self.log(f"[AlterEgo] llm request failed: {error}")
+            return False, "", "Сервер недоступен"
+
+        self.log(f"[AlterEgo] llm response status: {response.status_code}")
+        if response.status_code >= 400:
+            message = self._extract_server_message(response, "Ошибка генерации маски")
+            try:
+                body = response.text.strip() if isinstance(response.text, str) else ""
+            except Exception:
+                body = ""
+            self.log(f"[AlterEgo] llm error: {message}")
+            if body:
+                self.log(f"[AlterEgo] llm body: {body[:500]}")
+            return False, "", message
+
+        try:
+            data = response.json() if response.content else {}
+        except Exception as error:
+            self.log(f"[AlterEgo] llm parse failed: {error}")
+            return False, "", "Некорректный ответ сервера"
+
+        if isinstance(data, dict):
+            value = data.get("text")
+            if isinstance(value, str) and value.strip():
+                self.log("[AlterEgo] llm success: result_key=text")
+                return True, value.strip(), ""
+
+        self.log(
+            f"[AlterEgo] llm invalid response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}"
+        )
+        return False, "", "Сервер не вернул text"
+
+    @staticmethod
+    def _extract_text_from_send_params(params):
+        if params is None:
+            return ""
+
+        if isinstance(params, dict):
+            for key in (
+                "text",
+                "message",
+                "messageText",
+                "caption",
+                "content",
+            ):
+                value = params.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+
+        for attr in (
+            "text",
+            "message",
+            "messageText",
+            "caption",
+            "content",
+        ):
+            try:
+                value = getattr(params, attr)
+            except Exception:
+                value = get_private_field(params, attr)
+            if isinstance(value, str) and value.strip():
+                return value
+
+        return ""
+
+    @staticmethod
+    def _extract_send_params_meta(params):
+        data = {
+            "peer": None,
+            "scheduleDate": None,
+            "scheduleRepeatPeriod": None,
+        }
+
+        for key in data.keys():
+            value = None
+            try:
+                value = getattr(params, key)
+            except Exception:
+                value = get_private_field(params, key)
+            data[key] = value
+
+        return data
+
+    def _resend_masked_text_async(self, account, params_meta, masked_text):
+        if not isinstance(masked_text, str) or not masked_text.strip():
+            return
+
+        self._bypass_text_counts[masked_text] = (
+            int(self._bypass_text_counts.get(masked_text, 0)) + 1
+        )
+
+        def _worker():
+            try:
+                from java import jclass
+
+                SendMessagesHelper = jclass("org.telegram.messenger.SendMessagesHelper")
+                helper = SendMessagesHelper.getInstance(int(account))
+                if helper is None:
+                    self.log("[AlterEgo] resend failed: SendMessagesHelper is None")
+                    return
+
+                SendMessageParamsClass = jclass(
+                    "org.telegram.messenger.SendMessagesHelper$SendMessageParams"
+                )
+                send_params = SendMessageParamsClass()
+                resend_param_keys = set()
+
+                for key, value in params_meta.items():
+                    if value is None:
+                        continue
+                    try:
+                        setattr(send_params, key, value)
+                        resend_param_keys.add(key)
+                    except Exception:
+                        try:
+                            if set_private_field(send_params, key, value):
+                                resend_param_keys.add(key)
+                        except Exception:
+                            pass
+
+                try:
+                    setattr(send_params, "message", masked_text)
+                    resend_param_keys.add("message")
+                except Exception:
+                    if not set_private_field(send_params, "message", masked_text):
+                        self.log("[AlterEgo] resend failed: cannot set message")
+                        return
+
+                helper.sendMessage(send_params)
+                self.log(
+                    f"[AlterEgo] resend done with keys={sorted(list(resend_param_keys))}"
+                )
+                self._show_bulletin("Отправлено с маской", "success")
+            except Exception as error:
+                self.log(f"[AlterEgo] resend failed: {error}")
+                self.log(f"[AlterEgo] resend traceback: {traceback.format_exc()}")
+                self._show_bulletin("Ошибка повторной отправки", "error")
+
+        run_on_queue(_worker)
+
+    def _consume_bypass_text(self, text):
+        if not isinstance(text, str) or not text:
+            return False
+        count = int(self._bypass_text_counts.get(text, 0))
+        if count <= 0:
+            return False
+        if count == 1:
+            self._bypass_text_counts.pop(text, None)
+        else:
+            self._bypass_text_counts[text] = count - 1
+        return True
+
+    @staticmethod
+    def _is_ui_thread():
+        try:
+            from java import jclass
+
+            Looper = jclass("android.os.Looper")
+            return Looper.myLooper() == Looper.getMainLooper()
+        except Exception:
+            return False
+
+    def _process_mask_pipeline(self, source_text, api_url):
+        if not isinstance(source_text, str) or not source_text.strip():
+            return False, "", "Empty source text"
+        if not isinstance(api_url, str) or not self._is_url(api_url):
+            return False, "", "Invalid API URL"
+
+        cached = self._mask_cache.get(source_text)
+        if isinstance(cached, str) and cached.strip():
+            self.log("[AlterEgo] mask cache hit")
+            return True, cached, ""
+
+        normalized = api_url.rstrip("/")
+        success, masked_text, error_text = self._call_llm_mask_sync(
+            normalized, source_text
+        )
+        if not success or not isinstance(masked_text, str) or not masked_text.strip():
+            return False, "", error_text or "Masking failed"
+        self._mask_cache[source_text] = masked_text
+        if len(self._mask_cache) > 80:
+            try:
+                oldest_key = next(iter(self._mask_cache.keys()))
+                self._mask_cache.pop(oldest_key, None)
+            except Exception:
+                pass
+        return True, masked_text, ""
+
+    def _store_masked_message_sync(
+        self, api_base_url, dialog_id, telegram_message_id, source_text, masked_text
+    ):
+        headers = self._auth_headers(api_base_url)
+        payload = {
+            "dialogId": int(dialog_id) if isinstance(dialog_id, int) else 0,
+            "telegramMessageId": int(telegram_message_id)
+            if isinstance(telegram_message_id, int)
+            else 0,
+            "originalText": source_text,
+        }
+
+        try:
+            response = requests.post(
+                f"{api_base_url}/api/Messages",
+                json=payload,
+                headers=headers,
+                timeout=4,
+            )
+            self.log(
+                f"[AlterEgo] store masked message status: {response.status_code}, dialog_id={payload['dialogId']}, message_id={payload['telegramMessageId']}"
+            )
+        except Exception as error:
+            self.log(f"[AlterEgo] store masked message failed: {error}")
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            current_thread = threading.current_thread().name
+            self.log(
+                f"[AlterEgo] on_send_message_hook thread={current_thread}, is_ui={self._is_ui_thread()}"
+            )
+            self.log(
+                f"[AlterEgo] on_send_message_hook called: account={account}, params_type={type(params)}"
+            )
+            self.log(f"[AlterEgo] send params dump: {params}")
+            original_text = self._extract_text_from_send_params(params)
+            if not isinstance(original_text, str) or not original_text.strip():
+                self.log("[AlterEgo] send pipeline: empty text, skip")
+                return HookResult(strategy=HookStrategy.DEFAULT, params=params)
+
+            self.log(f"[AlterEgo] send pipeline source text: {original_text[:120]}")
+
+            if self._consume_bypass_text(original_text):
+                self.log("[AlterEgo] send pipeline: bypass for internal resend")
+                return HookResult(strategy=HookStrategy.DEFAULT, params=params)
+
+            api_url = self.get_setting("api_url", "")
+            if not isinstance(api_url, str) or not self._is_url(api_url):
+                self.log("[AlterEgo] fail-closed: invalid API URL, cancel send")
+                self._show_bulletin("Отправка отменена: неверный API URL", "error")
+                return HookResult(strategy=HookStrategy.CANCEL, params=params)
+
+            params_meta = self._extract_send_params_meta(params)
+            self._show_bulletin("Маскирую сообщение...", "info")
+
+            def _worker():
+                success, masked_text, error_text = self._process_mask_pipeline(
+                    original_text, api_url
+                )
+                if (
+                    not success
+                    or not isinstance(masked_text, str)
+                    or not masked_text.strip()
+                ):
+                    self.log(
+                        f"[AlterEgo] fail-closed: masking failed, send cancelled ({error_text})"
+                    )
+                    self._show_bulletin(
+                        f"Отправка отменена: {error_text or 'ошибка маскирования'}",
+                        "error",
+                    )
+                    return
+
+                self._mask_cache[original_text] = masked_text
+                if len(self._mask_cache) > 80:
+                    try:
+                        oldest_key = next(iter(self._mask_cache.keys()))
+                        self._mask_cache.pop(oldest_key, None)
+                    except Exception:
+                        pass
+
+                self._resend_masked_text_async(account, params_meta, masked_text)
+
+            run_on_queue(_worker)
+            self.log("[AlterEgo] fail-closed: cancel original send, start async mask")
+            return HookResult(strategy=HookStrategy.CANCEL, params=params)
+        except Exception as error:
+            self.log(f"[AlterEgo] send pipeline error: {error}")
+            self.log(f"[AlterEgo] send pipeline traceback: {traceback.format_exc()}")
+            return HookResult(strategy=HookStrategy.DEFAULT, params=params)
 
     def _status_banner_text(self, chat_activity=None):
         # User-defined text has priority over computed status text.
