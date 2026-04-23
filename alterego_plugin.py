@@ -7,6 +7,7 @@ __author__ = "@renamq"
 __icon__ = "exteraPlugins/1"
 # endregion
 
+import random
 import threading
 import time
 import traceback
@@ -29,7 +30,7 @@ ACTION_CANCEL = 3
 LONG_PRESS_DELAY_MS = 430
 STATUS_RETURN_DELAY_MS = 420
 STATUS_REFRESH_INTERVAL_MS = 5000
-LLM_TIMEOUT_SEC = 15
+MASK_TIMEOUT_SEC = 15
 
 
 class StatusTouchHelper:
@@ -291,8 +292,11 @@ class AlterEgo(BasePlugin):
         self._auth_expires_at_ms = 0
         self._auth_feedback = ""
         self._send_hook_registered = False
+        self._update_hook_ids = []
+        self._request_hook_ids = []
         self._mask_cache = {}
         self._bypass_text_counts = {}
+        self._pending_stored_messages = []
         self._status_touch = StatusTouchHelper(self)
         self._floating_view = FloatingDateViewHelper(self)
 
@@ -358,6 +362,43 @@ class AlterEgo(BasePlugin):
                 self.log("[AlterEgo] Send pipeline hook registered")
             except Exception as error:
                 self.log(f"[AlterEgo] Send pipeline hook failed: {error}")
+
+            try:
+                request_hook_names = [
+                    "TL_messages_sendMessage",
+                    "TL_messages_sendMedia",
+                    "TL_messages_sendMultiMedia",
+                ]
+                for hook_name in request_hook_names:
+                    hook_id = self.add_hook(
+                        hook_name, match_substring=True, priority=80
+                    )
+                    if hook_id:
+                        self._request_hook_ids.append(hook_id)
+                self.log(
+                    f"[AlterEgo] Request hooks registered: {len(self._request_hook_ids)}"
+                )
+            except Exception as error:
+                self.log(f"[AlterEgo] Request hook registration failed: {error}")
+
+            try:
+                update_hook_names = [
+                    "TL_updateNewMessage",
+                    "TL_updateNewChannelMessage",
+                    "updates",
+                    "updatesCombined",
+                ]
+                for hook_name in update_hook_names:
+                    hook_id = self.add_hook(
+                        hook_name, match_substring=True, priority=80
+                    )
+                    if hook_id:
+                        self._update_hook_ids.append(hook_id)
+                self.log(
+                    f"[AlterEgo] Update hooks registered: {len(self._update_hook_ids)}"
+                )
+            except Exception as error:
+                self.log(f"[AlterEgo] Update hook registration failed: {error}")
 
         except Exception as error:
             self.log(f"[AlterEgo] Hook setup failed: {error}")
@@ -601,52 +642,62 @@ class AlterEgo(BasePlugin):
 
         return {"Authorization": f"Bearer {self._auth_access_token}"}
 
-    def _call_llm_mask_sync(self, api_base_url, source_text, chat_context=""):
+    def _call_mask_sync(self, api_base_url, dialog_id, original_text):
         headers = self._auth_headers(api_base_url)
-        payload = {"message": source_text}
+        payload = {
+            "dialogId": int(dialog_id) if isinstance(dialog_id, int) else 0,
+            "originalText": original_text,
+        }
         self.log(
-            f"[AlterEgo] llm request: payload={{message}}, text_len={len(source_text)}, has_auth={bool(headers.get('Authorization'))}"
+            f"[AlterEgo] mask request: dialog={payload['dialogId']}, text_len={len(original_text)}"
         )
 
-        try:
-            response = requests.post(
-                f"{api_base_url}/api/Llm/generate",
-                json=payload,
-                headers=headers,
-                timeout=LLM_TIMEOUT_SEC,
-            )
-        except Exception as error:
-            self.log(f"[AlterEgo] llm request failed: {error}")
-            return False, "", "Сервер недоступен"
-
-        self.log(f"[AlterEgo] llm response status: {response.status_code}")
-        if response.status_code >= 400:
-            message = self._extract_server_message(response, "Ошибка генерации маски")
+        last_error = ""
+        for attempt in range(3):
             try:
-                body = response.text.strip() if isinstance(response.text, str) else ""
-            except Exception:
-                body = ""
-            self.log(f"[AlterEgo] llm error: {message}")
-            if body:
-                self.log(f"[AlterEgo] llm body: {body[:500]}")
-            return False, "", message
+                response = requests.post(
+                    f"{api_base_url}/api/Messages/mask",
+                    json=payload,
+                    headers=headers,
+                    timeout=MASK_TIMEOUT_SEC,
+                )
+            except Exception as error:
+                last_error = "Сервер недоступен"
+                self.log(f"[AlterEgo] mask request failed: {error}")
+                if attempt < 2:
+                    time.sleep(0.35)
+                    continue
+                return False, "", last_error
 
-        try:
-            data = response.json() if response.content else {}
-        except Exception as error:
-            self.log(f"[AlterEgo] llm parse failed: {error}")
-            return False, "", "Некорректный ответ сервера"
+            self.log(f"[AlterEgo] mask response status: {response.status_code}")
+            if response.status_code >= 500:
+                last_error = self._extract_server_message(
+                    response, "Ошибка генерации маски"
+                )
+                if attempt < 2:
+                    time.sleep(0.35)
+                    continue
+                return False, "", last_error
+            if response.status_code >= 400:
+                message = self._extract_server_message(
+                    response, "Ошибка генерации маски"
+                )
+                return False, "", message
 
-        if isinstance(data, dict):
-            value = data.get("text")
-            if isinstance(value, str) and value.strip():
-                self.log("[AlterEgo] llm success: result_key=text")
-                return True, value.strip(), ""
+            try:
+                data = response.json() if response.content else {}
+            except Exception as error:
+                self.log(f"[AlterEgo] mask parse failed: {error}")
+                return False, "", "Некорректный ответ сервера"
 
-        self.log(
-            f"[AlterEgo] llm invalid response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}"
-        )
-        return False, "", "Сервер не вернул text"
+            if isinstance(data, dict):
+                cover_text = data.get("coverText")
+                if isinstance(cover_text, str) and cover_text.strip():
+                    return True, cover_text.strip(), ""
+
+            return False, "", "Сервер не вернул coverText"
+
+        return False, "", last_error or "Ошибка генерации маски"
 
     @staticmethod
     def _extract_text_from_send_params(params):
@@ -687,6 +738,8 @@ class AlterEgo(BasePlugin):
             "peer": None,
             "scheduleDate": None,
             "scheduleRepeatPeriod": None,
+            "pendingRequestId": 0,
+            "clientRandomId": 0,
         }
 
         for key in data.keys():
@@ -697,9 +750,548 @@ class AlterEgo(BasePlugin):
                 value = get_private_field(params, key)
             data[key] = value
 
+        try:
+            pending_id = int(data.get("pendingRequestId") or 0)
+        except Exception:
+            pending_id = 0
+        try:
+            random_id = int(data.get("clientRandomId") or 0)
+        except Exception:
+            random_id = 0
+        try:
+            maybe_params = get_private_field(params, "params")
+            if isinstance(maybe_params, dict):
+                for key in ("pending_id", "pendingId", "req_id", "request_id"):
+                    value = maybe_params.get(key)
+                    try:
+                        pending_id = int(value)
+                        if pending_id:
+                            break
+                    except Exception:
+                        continue
+                for key in ("random_id", "randomId", "client_random_id"):
+                    value = maybe_params.get(key)
+                    try:
+                        random_id = int(value)
+                        if random_id:
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        if pending_id:
+            data["pendingRequestId"] = pending_id
+        for key in ("random_id", "randomId", "clientRandomId"):
+            if random_id:
+                break
+            try:
+                value = getattr(params, key)
+            except Exception:
+                value = get_private_field(params, key)
+            try:
+                random_id = int(value)
+            except Exception:
+                continue
+
+        if random_id:
+            data["clientRandomId"] = random_id
+
         return data
 
-    def _resend_masked_text_async(self, account, params_meta, masked_text):
+    @staticmethod
+    def _extract_dialog_id_from_peer(peer):
+        if peer is None:
+            return 0
+
+        for peer_attr in ("user_id", "userId"):
+            try:
+                v = getattr(peer, peer_attr)
+            except Exception:
+                v = get_private_field(peer, peer_attr)
+            try:
+                n = int(v)
+                if n:
+                    return n
+            except Exception:
+                pass
+
+        for peer_attr in ("chat_id", "chatId", "channel_id", "channelId"):
+            try:
+                v = getattr(peer, peer_attr)
+            except Exception:
+                v = get_private_field(peer, peer_attr)
+            try:
+                n = int(v)
+                if n:
+                    return -n
+            except Exception:
+                pass
+
+        return 0
+
+    @staticmethod
+    def _extract_message_from_update(update):
+        if update is None:
+            return None
+        try:
+            class_name = str(update.getClass().getName())
+            if class_name.endswith("TLRPC$Message"):
+                return update
+        except Exception:
+            pass
+        try:
+            message = getattr(update, "message")
+            if message is not None:
+                return message
+        except Exception:
+            pass
+        try:
+            message = get_private_field(update, "message")
+            if message is not None:
+                return message
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _extract_update_message_fields(update):
+        data = {
+            "pendingRequestId": 0,
+            "clientRandomId": 0,
+            "messageId": 0,
+            "dialogId": 0,
+            "text": "",
+            "out": False,
+        }
+
+        if update is None:
+            return data
+
+        message = AlterEgo._extract_message_from_update(update)
+        data["text"] = AlterEgo._extract_message_text(message)
+        data["messageId"] = AlterEgo._extract_message_id(message)
+        data["dialogId"] = AlterEgo._extract_dialog_id_from_message(message)
+        data["out"] = False
+
+        if message is not None:
+            for attr in ("out", "isOut"):
+                try:
+                    v = getattr(message, attr)
+                except Exception:
+                    v = get_private_field(message, attr)
+                if isinstance(v, bool):
+                    data["out"] = v
+                    break
+
+            try:
+                random_id = getattr(message, "random_id")
+            except Exception:
+                random_id = get_private_field(message, "random_id")
+            try:
+                data["clientRandomId"] = int(random_id)
+            except Exception:
+                pass
+
+        # Fallback for update types without nested Message object
+        if data["messageId"] <= 0:
+            try:
+                data["messageId"] = int(getattr(update, "id"))
+            except Exception:
+                try:
+                    data["messageId"] = int(get_private_field(update, "id"))
+                except Exception:
+                    pass
+
+        if not data["text"]:
+            try:
+                maybe_text = getattr(update, "message")
+            except Exception:
+                maybe_text = get_private_field(update, "message")
+            if isinstance(maybe_text, str):
+                data["text"] = maybe_text
+
+        if data["clientRandomId"] == 0:
+            try:
+                data["clientRandomId"] = int(getattr(update, "random_id"))
+            except Exception:
+                try:
+                    data["clientRandomId"] = int(get_private_field(update, "random_id"))
+                except Exception:
+                    pass
+
+        if data["dialogId"] == 0:
+            # Common shape for TL_updateShortSentMessage
+            try:
+                user_id = int(getattr(update, "user_id"))
+                if user_id:
+                    data["dialogId"] = user_id
+            except Exception:
+                pass
+
+        if data["dialogId"] == 0:
+            peer = None
+            for attr in ("peer", "peer_id", "peerId"):
+                try:
+                    peer = getattr(update, attr)
+                except Exception:
+                    peer = get_private_field(update, attr)
+                if peer is not None:
+                    break
+            data["dialogId"] = AlterEgo._extract_dialog_id_from_peer(peer)
+
+        for attr in ("pts", "pts_count"):
+            try:
+                _ = getattr(update, attr)
+            except Exception:
+                pass
+
+        for attr in ("qts", "seq"):
+            try:
+                _ = getattr(update, attr)
+            except Exception:
+                pass
+
+        try:
+            pending = get_private_field(update, "pending_req_id")
+            data["pendingRequestId"] = int(pending)
+        except Exception:
+            pass
+
+        return data
+
+    @staticmethod
+    def _extract_message_text(message):
+        if message is None:
+            return ""
+        for attr in ("message", "text"):
+            try:
+                value = getattr(message, attr)
+            except Exception:
+                value = get_private_field(message, attr)
+            if isinstance(value, str) and value.strip():
+                return value
+        return ""
+
+    @staticmethod
+    def _extract_message_id(message):
+        if message is None:
+            return 0
+        for attr in ("id", "message_id"):
+            try:
+                value = getattr(message, attr)
+            except Exception:
+                value = get_private_field(message, attr)
+            try:
+                value_int = int(value)
+                if value_int > 0:
+                    return value_int
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
+    def _extract_dialog_id_from_message(message):
+        if message is None:
+            return 0
+
+        for attr in ("dialog_id", "dialogId"):
+            try:
+                value = getattr(message, attr)
+            except Exception:
+                value = get_private_field(message, attr)
+            try:
+                value_int = int(value)
+                if value_int != 0:
+                    return value_int
+            except Exception:
+                pass
+
+        peer = None
+        for attr in ("peer_id", "peerId", "to_id", "toId"):
+            try:
+                peer = getattr(message, attr)
+            except Exception:
+                peer = get_private_field(message, attr)
+            if peer is not None:
+                break
+
+        return AlterEgo._extract_dialog_id_from_peer(peer)
+
+    @staticmethod
+    def _generate_random_id():
+        value = int(random.getrandbits(63))
+        if value == 0:
+            value = int(random.getrandbits(62)) + 1
+        return value
+
+    @staticmethod
+    def _extract_sender_user_id(message):
+        if message is None:
+            return 0
+
+        from_id = None
+        for attr in ("from_id", "fromId"):
+            try:
+                from_id = getattr(message, attr)
+            except Exception:
+                from_id = get_private_field(message, attr)
+            if from_id is not None:
+                break
+
+        if from_id is None:
+            return 0
+
+        for attr in ("user_id", "userId"):
+            try:
+                value = getattr(from_id, attr)
+            except Exception:
+                value = get_private_field(from_id, attr)
+            try:
+                value_int = int(value)
+                if value_int > 0:
+                    return value_int
+            except Exception:
+                continue
+
+        return 0
+
+    @staticmethod
+    def _extract_current_user_id(account):
+        try:
+            UserConfig = jclass("org.telegram.messenger.UserConfig")
+            config = UserConfig.getInstance(int(account))
+            return int(config.getClientUserId())
+        except Exception:
+            return 0
+
+    def _is_outgoing_message(self, message, account):
+        if message is None:
+            return False
+
+        for attr in ("out", "isOut"):
+            try:
+                v = getattr(message, attr)
+            except Exception:
+                v = get_private_field(message, attr)
+            if isinstance(v, bool):
+                return v
+            try:
+                v_int = int(v)
+                return v_int != 0
+            except Exception:
+                continue
+
+        current_user_id = self._extract_current_user_id(account)
+        sender_user_id = self._extract_sender_user_id(message)
+        return bool(
+            current_user_id and sender_user_id and current_user_id == sender_user_id
+        )
+
+        return False
+
+    def _try_store_pending_from_message(self, message):
+        if message is None or not self._pending_stored_messages:
+            return False
+
+        text = self._extract_message_text(message)
+        if not isinstance(text, str) or not text.strip():
+            return False
+
+        message_id = self._extract_message_id(message)
+        if message_id <= 0:
+            return False
+
+        dialog_id = self._extract_dialog_id_from_message(message)
+
+        now = self._now_ms()
+        matched_index = -1
+        for idx in range(len(self._pending_stored_messages) - 1, -1, -1):
+            item = self._pending_stored_messages[idx]
+            created_at = int(item.get("createdAtMs") or 0)
+            if created_at and now - created_at > 180000:
+                continue
+
+            item_text = item.get("coverText")
+            item_dialog = int(item.get("dialogId") or 0)
+            if (
+                isinstance(item_text, str)
+                and item_text.strip() == text.strip()
+                and (item_dialog == 0 or dialog_id == 0 or item_dialog == dialog_id)
+            ):
+                matched_index = idx
+                break
+
+        if matched_index < 0:
+            for idx in range(len(self._pending_stored_messages) - 1, -1, -1):
+                item = self._pending_stored_messages[idx]
+                created_at = int(item.get("createdAtMs") or 0)
+                if created_at and now - created_at > 30000:
+                    continue
+                item_dialog = int(item.get("dialogId") or 0)
+                if item_dialog and dialog_id and item_dialog != dialog_id:
+                    continue
+                matched_index = idx
+                self.log(
+                    f"[AlterEgo] pending fallback match used: dialog={dialog_id}, messageId={message_id}"
+                )
+                break
+
+        if matched_index < 0:
+            self.log(
+                f"[AlterEgo] no pending match: text='{text[:80]}', dialog={dialog_id}, pending={len(self._pending_stored_messages)}"
+            )
+            return False
+
+        item = self._pending_stored_messages.pop(matched_index)
+        api_url = self.get_setting("api_url", "")
+        if not isinstance(api_url, str) or not self._is_url(api_url):
+            return False
+
+        normalized = api_url.rstrip("/")
+        resolved_dialog = dialog_id if dialog_id else int(item.get("dialogId") or 0)
+        original_text = item.get("originalText") or text
+        cover_text = item.get("coverText") or ""
+        if not isinstance(cover_text, str) or not cover_text.strip():
+            return False
+        if text.strip() != cover_text.strip():
+            return False
+
+        run_on_queue(
+            lambda: self._store_message_sync(
+                normalized,
+                resolved_dialog,
+                message_id,
+                original_text,
+                cover_text,
+            )
+        )
+        self.log(
+            f"[AlterEgo] updated stored message with real telegramMessageId={message_id}"
+        )
+        return True
+
+    def _try_store_pending_from_update(self, update, account):
+        if update is None or not self._pending_stored_messages:
+            return False
+
+        fields = self._extract_update_message_fields(update)
+
+        message_id = int(fields.get("messageId") or 0)
+        if message_id <= 0:
+            return False
+
+        dialog_id = int(fields.get("dialogId") or 0)
+        pending_req_id = int(fields.get("pendingRequestId") or 0)
+        random_id = int(fields.get("clientRandomId") or 0)
+        text = fields.get("text") or ""
+        current_user_id = self._extract_current_user_id(account)
+
+        now = self._now_ms()
+        matched_index = -1
+
+        if random_id:
+            for idx in range(len(self._pending_stored_messages) - 1, -1, -1):
+                item = self._pending_stored_messages[idx]
+                if int(item.get("clientRandomId") or 0) == random_id:
+                    matched_index = idx
+                    self.log(
+                        f"[AlterEgo] pending match by random_id={random_id}, messageId={message_id}"
+                    )
+                    break
+
+        if matched_index < 0 and pending_req_id:
+            for idx in range(len(self._pending_stored_messages) - 1, -1, -1):
+                item = self._pending_stored_messages[idx]
+                if int(item.get("pendingRequestId") or 0) == pending_req_id:
+                    matched_index = idx
+                    self.log(
+                        f"[AlterEgo] pending match by pending_req_id={pending_req_id}, messageId={message_id}"
+                    )
+                    break
+
+        if matched_index < 0:
+            # For short-sent updates with no random/pending ids,
+            # match by account+dialog and nearest timestamp.
+            for idx in range(len(self._pending_stored_messages) - 1, -1, -1):
+                item = self._pending_stored_messages[idx]
+                created_at = int(item.get("createdAtMs") or 0)
+                if created_at and now - created_at > 30000:
+                    continue
+                item_dialog = int(item.get("dialogId") or 0)
+                if dialog_id and item_dialog and dialog_id != item_dialog:
+                    continue
+                item_account = int(item.get("account") or 0)
+                if current_user_id and item_account and current_user_id != item_account:
+                    continue
+                matched_index = idx
+                self.log(
+                    f"[AlterEgo] pending fallback by account+dialog, messageId={message_id}"
+                )
+                break
+
+        if matched_index < 0:
+            for idx in range(len(self._pending_stored_messages) - 1, -1, -1):
+                item = self._pending_stored_messages[idx]
+                created_at = int(item.get("createdAtMs") or 0)
+                if created_at and now - created_at > 180000:
+                    continue
+
+                item_text = item.get("coverText")
+                item_dialog = int(item.get("dialogId") or 0)
+                if (
+                    isinstance(item_text, str)
+                    and isinstance(text, str)
+                    and item_text.strip() == text.strip()
+                    and (item_dialog == 0 or dialog_id == 0 or item_dialog == dialog_id)
+                ):
+                    matched_index = idx
+                    break
+
+        if matched_index < 0:
+            self.log(
+                f"[AlterEgo] no raw-update pending match: msgId={message_id}, dialog={dialog_id}, randomId={random_id}, pendingReqId={pending_req_id}, pending={len(self._pending_stored_messages)}"
+            )
+
+        if matched_index < 0:
+            return False
+
+        item = self._pending_stored_messages.pop(matched_index)
+        api_url = self.get_setting("api_url", "")
+        if not isinstance(api_url, str) or not self._is_url(api_url):
+            return False
+
+        normalized = api_url.rstrip("/")
+        resolved_dialog = dialog_id if dialog_id else int(item.get("dialogId") or 0)
+        original_text = item.get("originalText") or text
+        cover_text = item.get("coverText") or ""
+
+        if not isinstance(cover_text, str) or not cover_text.strip():
+            return False
+
+        run_on_queue(
+            lambda: self._store_message_sync(
+                normalized,
+                resolved_dialog,
+                message_id,
+                original_text,
+                cover_text,
+            )
+        )
+        self.log(
+            f"[AlterEgo] updated stored message with real telegramMessageId={message_id}"
+        )
+        return True
+
+    def _resend_masked_text_async(
+        self,
+        account,
+        params_meta,
+        masked_text,
+        api_base_url,
+        source_text,
+        source_params,
+    ):
         if not isinstance(masked_text, str) or not masked_text.strip():
             return
 
@@ -717,21 +1309,51 @@ class AlterEgo(BasePlugin):
                     self.log("[AlterEgo] resend failed: SendMessagesHelper is None")
                     return
 
-                SendMessageParamsClass = jclass(
-                    "org.telegram.messenger.SendMessagesHelper$SendMessageParams"
-                )
-                send_params = SendMessageParamsClass()
                 resend_param_keys = set()
+                send_params = source_params
+                if send_params is None:
+                    SendMessageParamsClass = jclass(
+                        "org.telegram.messenger.SendMessagesHelper$SendMessageParams"
+                    )
+                    send_params = SendMessageParamsClass()
+                    for key, value in params_meta.items():
+                        if value is None:
+                            continue
+                        try:
+                            setattr(send_params, key, value)
+                            resend_param_keys.add(key)
+                        except Exception:
+                            try:
+                                if set_private_field(send_params, key, value):
+                                    resend_param_keys.add(key)
+                            except Exception:
+                                pass
 
-                for key, value in params_meta.items():
-                    if value is None:
-                        continue
+                random_id = int(params_meta.get("clientRandomId") or 0)
+                if not random_id:
+                    for key in ("random_id", "randomId", "clientRandomId"):
+                        try:
+                            value = getattr(send_params, key)
+                        except Exception:
+                            value = get_private_field(send_params, key)
+                        try:
+                            random_id = int(value)
+                            if random_id:
+                                break
+                        except Exception:
+                            continue
+
+                if not random_id:
+                    random_id = self._generate_random_id()
+                    params_meta["clientRandomId"] = random_id
+
+                for key in ("random_id", "randomId", "clientRandomId"):
                     try:
-                        setattr(send_params, key, value)
+                        setattr(send_params, key, random_id)
                         resend_param_keys.add(key)
                     except Exception:
                         try:
-                            if set_private_field(send_params, key, value):
+                            if set_private_field(send_params, key, random_id):
                                 resend_param_keys.add(key)
                         except Exception:
                             pass
@@ -748,6 +1370,27 @@ class AlterEgo(BasePlugin):
                 self.log(
                     f"[AlterEgo] resend done with keys={sorted(list(resend_param_keys))}"
                 )
+
+                dialog_id = params_meta.get("peer")
+                self._pending_stored_messages.append(
+                    {
+                        "account": self._extract_current_user_id(account),
+                        "dialogId": int(dialog_id) if isinstance(dialog_id, int) else 0,
+                        "originalText": source_text,
+                        "coverText": masked_text,
+                        "createdAtMs": self._now_ms(),
+                        "pendingRequestId": int(
+                            params_meta.get("pendingRequestId") or 0
+                        ),
+                        "clientRandomId": int(params_meta.get("clientRandomId") or 0),
+                    }
+                )
+                self.log(
+                    f"[AlterEgo] pending added: dialog={int(dialog_id) if isinstance(dialog_id, int) else 0}, pendingReqId={int(params_meta.get('pendingRequestId') or 0)}, randomId={int(params_meta.get('clientRandomId') or 0)}, cover='{masked_text[:80]}'"
+                )
+                if len(self._pending_stored_messages) > 120:
+                    self._pending_stored_messages = self._pending_stored_messages[-120:]
+
                 self._show_bulletin("Отправлено с маской", "success")
             except Exception as error:
                 self.log(f"[AlterEgo] resend failed: {error}")
@@ -778,34 +1421,35 @@ class AlterEgo(BasePlugin):
         except Exception:
             return False
 
-    def _process_mask_pipeline(self, source_text, api_url):
+    def _process_mask_pipeline(self, dialog_id, source_text, api_url):
         if not isinstance(source_text, str) or not source_text.strip():
             return False, "", "Empty source text"
         if not isinstance(api_url, str) or not self._is_url(api_url):
             return False, "", "Invalid API URL"
 
-        cached = self._mask_cache.get(source_text)
+        cache_key = (int(dialog_id) if isinstance(dialog_id, int) else 0, source_text)
+        cached = self._mask_cache.get(cache_key)
         if isinstance(cached, str) and cached.strip():
             self.log("[AlterEgo] mask cache hit")
             return True, cached, ""
 
         normalized = api_url.rstrip("/")
-        success, masked_text, error_text = self._call_llm_mask_sync(
-            normalized, source_text
+        success, cover_text, error_text = self._call_mask_sync(
+            normalized, dialog_id, source_text
         )
-        if not success or not isinstance(masked_text, str) or not masked_text.strip():
+        if not success or not isinstance(cover_text, str) or not cover_text.strip():
             return False, "", error_text or "Masking failed"
-        self._mask_cache[source_text] = masked_text
+        self._mask_cache[cache_key] = cover_text
         if len(self._mask_cache) > 80:
             try:
                 oldest_key = next(iter(self._mask_cache.keys()))
                 self._mask_cache.pop(oldest_key, None)
             except Exception:
                 pass
-        return True, masked_text, ""
+        return True, cover_text, ""
 
-    def _store_masked_message_sync(
-        self, api_base_url, dialog_id, telegram_message_id, source_text, masked_text
+    def _store_message_sync(
+        self, api_base_url, dialog_id, telegram_message_id, source_text, cover_text
     ):
         headers = self._auth_headers(api_base_url)
         payload = {
@@ -814,20 +1458,38 @@ class AlterEgo(BasePlugin):
             if isinstance(telegram_message_id, int)
             else 0,
             "originalText": source_text,
+            "coverText": cover_text,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
         }
 
-        try:
-            response = requests.post(
-                f"{api_base_url}/api/Messages",
-                json=payload,
-                headers=headers,
-                timeout=4,
-            )
+        last_error = ""
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    f"{api_base_url}/api/Messages",
+                    json=payload,
+                    headers=headers,
+                    timeout=4,
+                )
+            except Exception as error:
+                last_error = str(error)
+                self.log(f"[AlterEgo] store message failed: {error}")
+                if attempt < 2:
+                    time.sleep(0.35)
+                    continue
+                return
+
             self.log(
-                f"[AlterEgo] store masked message status: {response.status_code}, dialog_id={payload['dialogId']}, message_id={payload['telegramMessageId']}"
+                f"[AlterEgo] store message status: {response.status_code}, dialog_id={payload['dialogId']}, message_id={payload['telegramMessageId']}"
             )
-        except Exception as error:
-            self.log(f"[AlterEgo] store masked message failed: {error}")
+            if response.status_code >= 500:
+                last_error = self._extract_server_message(
+                    response, "Store message failed"
+                )
+                if attempt < 2:
+                    time.sleep(0.35)
+                    continue
+            return
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
         try:
@@ -858,10 +1520,11 @@ class AlterEgo(BasePlugin):
 
             params_meta = self._extract_send_params_meta(params)
             self._show_bulletin("Маскирую сообщение...", "info")
+            dialog_id = params_meta.get("peer")
 
             def _worker():
                 success, masked_text, error_text = self._process_mask_pipeline(
-                    original_text, api_url
+                    dialog_id, original_text, api_url
                 )
                 if (
                     not success
@@ -877,7 +1540,11 @@ class AlterEgo(BasePlugin):
                     )
                     return
 
-                self._mask_cache[original_text] = masked_text
+                cache_key = (
+                    int(dialog_id) if isinstance(dialog_id, int) else 0,
+                    original_text,
+                )
+                self._mask_cache[cache_key] = masked_text
                 if len(self._mask_cache) > 80:
                     try:
                         oldest_key = next(iter(self._mask_cache.keys()))
@@ -885,7 +1552,14 @@ class AlterEgo(BasePlugin):
                     except Exception:
                         pass
 
-                self._resend_masked_text_async(account, params_meta, masked_text)
+                self._resend_masked_text_async(
+                    account,
+                    params_meta,
+                    masked_text,
+                    api_url.rstrip("/"),
+                    original_text,
+                    params,
+                )
 
             run_on_queue(_worker)
             self.log("[AlterEgo] fail-closed: cancel original send, start async mask")
@@ -894,6 +1568,78 @@ class AlterEgo(BasePlugin):
             self.log(f"[AlterEgo] send pipeline error: {error}")
             self.log(f"[AlterEgo] send pipeline traceback: {traceback.format_exc()}")
             return HookResult(strategy=HookStrategy.DEFAULT, params=params)
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        try:
+            if not self._pending_stored_messages:
+                return HookResult(strategy=HookStrategy.DEFAULT, update=update)
+            if self._try_store_pending_from_update(update, account):
+                self.log("[AlterEgo] on_update_hook: stored by raw update")
+                return HookResult(strategy=HookStrategy.DEFAULT, update=update)
+            message = self._extract_message_from_update(update)
+            if self._try_store_pending_from_message(message):
+                self.log("[AlterEgo] on_update_hook: stored by single update")
+            return HookResult(strategy=HookStrategy.DEFAULT, update=update)
+        except Exception as error:
+            self.log(f"[AlterEgo] on_update_hook error: {error}")
+            self.log(f"[AlterEgo] on_update_hook traceback: {traceback.format_exc()}")
+            return HookResult(strategy=HookStrategy.DEFAULT, update=update)
+
+    def on_updates_hook(
+        self, container_name: str, account: int, updates: Any
+    ) -> HookResult:
+        try:
+            if not self._pending_stored_messages or updates is None:
+                return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
+
+            items = None
+            try:
+                items = getattr(updates, "updates")
+            except Exception:
+                items = get_private_field(updates, "updates")
+
+            if items is None:
+                self.log(
+                    f"[AlterEgo] on_updates_hook: no updates field for container={container_name}"
+                )
+                return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
+
+            def _iter_items(java_or_py_list):
+                if java_or_py_list is None:
+                    return []
+                try:
+                    size = int(java_or_py_list.size())
+                    return [java_or_py_list.get(i) for i in range(size)]
+                except Exception:
+                    try:
+                        return list(java_or_py_list)
+                    except Exception:
+                        return []
+
+            processed = 0
+            for update in _iter_items(items):
+                processed += 1
+                if self._try_store_pending_from_update(update, account):
+                    self.log(
+                        f"[AlterEgo] on_updates_hook: stored from raw update container={container_name}, processed={processed}"
+                    )
+                    break
+                message = self._extract_message_from_update(update)
+                if self._try_store_pending_from_message(message):
+                    self.log(
+                        f"[AlterEgo] on_updates_hook: stored from container={container_name}, processed={processed}"
+                    )
+                    break
+            else:
+                self.log(
+                    f"[AlterEgo] on_updates_hook: no store match in container={container_name}, processed={processed}"
+                )
+
+            return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
+        except Exception as error:
+            self.log(f"[AlterEgo] on_updates_hook error: {error}")
+            self.log(f"[AlterEgo] on_updates_hook traceback: {traceback.format_exc()}")
+            return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
 
     def _status_banner_text(self, chat_activity=None):
         # User-defined text has priority over computed status text.
