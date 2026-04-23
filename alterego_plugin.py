@@ -18,7 +18,14 @@ from urllib.parse import urlparse
 
 import requests
 from android_utils import run_on_ui_thread, OnClickListener
-from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from base_plugin import (
+    BasePlugin,
+    MethodHook,
+    HookResult,
+    HookStrategy,
+    MenuItemData,
+    MenuItemType,
+)
 from client_utils import run_on_queue, get_last_fragment
 from hook_utils import find_class, get_private_field, set_private_field
 from ui.bulletin import BulletinHelper
@@ -299,6 +306,7 @@ class AlterEgo(BasePlugin):
         self._pending_stored_messages = []
         self._status_touch = StatusTouchHelper(self)
         self._floating_view = FloatingDateViewHelper(self)
+        self._dialog_menu_item_id = None
 
     def on_plugin_load(self):
         try:
@@ -362,6 +370,11 @@ class AlterEgo(BasePlugin):
                 self.log("[AlterEgo] Send pipeline hook registered")
             except Exception as error:
                 self.log(f"[AlterEgo] Send pipeline hook failed: {error}")
+
+            try:
+                self._register_dialog_toggle_menu()
+            except Exception as error:
+                self.log(f"[AlterEgo] Dialog menu item registration failed: {error}")
 
             try:
                 request_hook_names = [
@@ -831,6 +844,23 @@ class AlterEgo(BasePlugin):
         return 0
 
     @staticmethod
+    def _extract_id_from_object(obj):
+        if obj is None:
+            return 0
+        for attr in ("id", "user_id", "chat_id", "channel_id"):
+            try:
+                value = getattr(obj, attr)
+            except Exception:
+                value = get_private_field(obj, attr)
+            try:
+                value_int = int(value)
+                if value_int:
+                    return value_int
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
     def _extract_message_from_update(update):
         if update is None:
             return None
@@ -940,6 +970,17 @@ class AlterEgo(BasePlugin):
                     break
             data["dialogId"] = AlterEgo._extract_dialog_id_from_peer(peer)
 
+        if data["dialogId"] == 0:
+            peer = None
+            for attr in ("peer", "peer_id", "peerId"):
+                try:
+                    peer = getattr(update, attr)
+                except Exception:
+                    peer = get_private_field(update, attr)
+                if peer is not None:
+                    break
+            data["dialogId"] = AlterEgo._extract_dialog_id_from_peer(peer)
+
         for attr in ("pts", "pts_count"):
             try:
                 _ = getattr(update, attr)
@@ -1024,6 +1065,135 @@ class AlterEgo(BasePlugin):
         if value == 0:
             value = int(random.getrandbits(62)) + 1
         return value
+
+    @staticmethod
+    def _get_context_value(context, key):
+        if context is None:
+            return None
+        try:
+            if hasattr(context, "get"):
+                return context.get(key)
+        except Exception:
+            pass
+        try:
+            return getattr(context, key)
+        except Exception:
+            return get_private_field(context, key)
+
+    def _extract_dialog_id_from_context(self, context):
+        for key in ("dialogId", "dialog_id", "chatId", "chat_id"):
+            value = self._get_context_value(context, key)
+            try:
+                value_int = int(value)
+                if value_int:
+                    return value_int
+            except Exception:
+                pass
+
+        for key in ("peer", "peer_id", "peerId", "dialog", "dialog_id"):
+            peer = self._get_context_value(context, key)
+            dialog_id = self._extract_dialog_id_from_peer(peer)
+            if dialog_id:
+                return dialog_id
+
+        message = self._get_context_value(context, "message")
+        dialog_id = self._extract_dialog_id_from_message(message)
+        if dialog_id:
+            return dialog_id
+
+        chat = self._get_context_value(context, "chat") or self._get_context_value(
+            context, "channel"
+        )
+        chat_id = self._extract_id_from_object(chat)
+        if chat_id:
+            return -chat_id
+
+        user = self._get_context_value(context, "user")
+        user_id = self._extract_id_from_object(user)
+        if user_id:
+            return user_id
+
+        return 0
+
+    def _resolve_dialog_id_from_params_meta(self, params_meta):
+        if not isinstance(params_meta, dict):
+            return 0
+        peer = params_meta.get("peer")
+        if isinstance(peer, int):
+            return peer
+        return self._extract_dialog_id_from_peer(peer)
+
+    def _get_enabled_dialog_ids(self):
+        raw = self.get_setting("dialog_enabled_ids", "")
+        if isinstance(raw, list):
+            values = raw
+        else:
+            values = str(raw).replace(" ", "").split(",") if raw else []
+        result = set()
+        for value in values:
+            try:
+                value_int = int(value)
+                if value_int:
+                    result.add(value_int)
+            except Exception:
+                continue
+        return result
+
+    def _is_dialog_enabled(self, dialog_id):
+        if not dialog_id:
+            return False
+        return dialog_id in self._get_enabled_dialog_ids()
+
+    def _set_dialog_enabled(self, dialog_id, enabled):
+        if not dialog_id:
+            return
+        current = self._get_enabled_dialog_ids()
+        if enabled:
+            current.add(dialog_id)
+        else:
+            current.discard(dialog_id)
+        serialized = ",".join(str(value) for value in sorted(current))
+        self.set_setting("dialog_enabled_ids", serialized)
+
+    def _register_dialog_toggle_menu(self):
+        if self._dialog_menu_item_id:
+            return
+        item = MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Alter Ego",
+            subtext="Включить/выключить для диалога",
+            icon="ai_chat_solar",
+            on_click=self._toggle_dialog_menu,
+            item_id="alterego_dialog_toggle",
+            priority=10,
+        )
+        self._dialog_menu_item_id = self.add_menu_item(item)
+
+    def _toggle_dialog_menu(self, context):
+        dialog_id = self._extract_dialog_id_from_context(context)
+        if not dialog_id:
+            context_keys = "n/a"
+            try:
+                if isinstance(context, dict):
+                    context_keys = list(context.keys())
+            except Exception:
+                pass
+            class_name = ""
+            try:
+                class_name = str(context.getClass().getName())
+            except Exception:
+                class_name = type(context).__name__ if context is not None else "None"
+            self.log(
+                f"[AlterEgo] dialog toggle: unknown context keys={context_keys}, class={class_name}"
+            )
+            self._show_bulletin("Не удалось определить диалог", "error")
+            return
+        enabled = not self._is_dialog_enabled(dialog_id)
+        self._set_dialog_enabled(dialog_id, enabled)
+        if enabled:
+            self._show_bulletin("Alter Ego включен для диалога", "success")
+        else:
+            self._show_bulletin("Alter Ego выключен для диалога", "info")
 
     @staticmethod
     def _extract_sender_user_id(message):
@@ -1519,6 +1689,10 @@ class AlterEgo(BasePlugin):
                 return HookResult(strategy=HookStrategy.CANCEL, params=params)
 
             params_meta = self._extract_send_params_meta(params)
+            dialog_id = self._resolve_dialog_id_from_params_meta(params_meta)
+            if dialog_id and not self._is_dialog_enabled(dialog_id):
+                self.log("[AlterEgo] send pipeline: dialog disabled, skip")
+                return HookResult(strategy=HookStrategy.DEFAULT, params=params)
             self._show_bulletin("Маскирую сообщение...", "info")
             dialog_id = params_meta.get("peer")
 
@@ -1676,6 +1850,42 @@ class AlterEgo(BasePlugin):
             return int(chat_activity.hashCode())
         except Exception:
             return str(chat_activity)
+
+    def _extract_dialog_id_from_chat_activity(self, chat_activity):
+        if chat_activity is None:
+            return 0
+        dialog_id = 0
+        for attr in ("dialogId", "dialog_id"):
+            try:
+                value = getattr(chat_activity, attr)
+            except Exception:
+                value = get_private_field(chat_activity, attr)
+            try:
+                dialog_id = int(value)
+                if dialog_id:
+                    return dialog_id
+            except Exception:
+                continue
+
+        try:
+            chat = get_private_field(chat_activity, "currentChat")
+        except Exception:
+            chat = None
+        if chat is not None:
+            chat_id = self._extract_id_from_object(chat)
+            if chat_id:
+                return -chat_id
+
+        try:
+            user = get_private_field(chat_activity, "currentUser")
+        except Exception:
+            user = None
+        if user is not None:
+            user_id = self._extract_id_from_object(user)
+            if user_id:
+                return user_id
+
+        return 0
 
     @staticmethod
     def _now_ms():
@@ -1857,6 +2067,11 @@ class AlterEgo(BasePlugin):
 
     def _apply_floating_date_status(self, chat_activity):
         if chat_activity is None:
+            return
+
+        dialog_id = self._extract_dialog_id_from_chat_activity(chat_activity)
+        if dialog_id and not self._is_dialog_enabled(dialog_id):
+            self._restore_native_floating_date(chat_activity)
             return
 
         floating_date_view = self._floating_view.apply_status_text(
