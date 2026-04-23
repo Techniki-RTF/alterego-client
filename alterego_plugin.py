@@ -37,7 +37,7 @@ ACTION_CANCEL = 3
 LONG_PRESS_DELAY_MS = 430
 STATUS_RETURN_DELAY_MS = 420
 STATUS_REFRESH_INTERVAL_MS = 5000
-MASK_TIMEOUT_SEC = 15
+MASK_TIMEOUT_SEC = 30
 
 
 class StatusTouchHelper:
@@ -1536,32 +1536,48 @@ class AlterEgo(BasePlugin):
                         self.log("[AlterEgo] resend failed: cannot set message")
                         return
 
-                helper.sendMessage(send_params)
-                self.log(
-                    f"[AlterEgo] resend done with keys={sorted(list(resend_param_keys))}"
-                )
+                def _send_on_ui():
+                    try:
+                        helper.sendMessage(send_params)
+                        self.log(
+                            f"[AlterEgo] resend done with keys={sorted(list(resend_param_keys))}"
+                        )
 
-                dialog_id = params_meta.get("peer")
-                self._pending_stored_messages.append(
-                    {
-                        "account": self._extract_current_user_id(account),
-                        "dialogId": int(dialog_id) if isinstance(dialog_id, int) else 0,
-                        "originalText": source_text,
-                        "coverText": masked_text,
-                        "createdAtMs": self._now_ms(),
-                        "pendingRequestId": int(
-                            params_meta.get("pendingRequestId") or 0
-                        ),
-                        "clientRandomId": int(params_meta.get("clientRandomId") or 0),
-                    }
-                )
-                self.log(
-                    f"[AlterEgo] pending added: dialog={int(dialog_id) if isinstance(dialog_id, int) else 0}, pendingReqId={int(params_meta.get('pendingRequestId') or 0)}, randomId={int(params_meta.get('clientRandomId') or 0)}, cover='{masked_text[:80]}'"
-                )
-                if len(self._pending_stored_messages) > 120:
-                    self._pending_stored_messages = self._pending_stored_messages[-120:]
+                        dialog_id = params_meta.get("peer")
+                        self._pending_stored_messages.append(
+                            {
+                                "account": self._extract_current_user_id(account),
+                                "dialogId": int(dialog_id)
+                                if isinstance(dialog_id, int)
+                                else 0,
+                                "originalText": source_text,
+                                "coverText": masked_text,
+                                "createdAtMs": self._now_ms(),
+                                "pendingRequestId": int(
+                                    params_meta.get("pendingRequestId") or 0
+                                ),
+                                "clientRandomId": int(
+                                    params_meta.get("clientRandomId") or 0
+                                ),
+                            }
+                        )
+                        self.log(
+                            f"[AlterEgo] pending added: dialog={int(dialog_id) if isinstance(dialog_id, int) else 0}, pendingReqId={int(params_meta.get('pendingRequestId') or 0)}, randomId={int(params_meta.get('clientRandomId') or 0)}, cover='{masked_text[:80]}'"
+                        )
+                        if len(self._pending_stored_messages) > 120:
+                            self._pending_stored_messages = (
+                                self._pending_stored_messages[-120:]
+                            )
 
-                self._show_bulletin("Отправлено с маской", "success")
+                        self._show_bulletin("Отправлено с маской", "success")
+                    except Exception as error:
+                        self.log(f"[AlterEgo] resend failed: {error}")
+                        self.log(
+                            f"[AlterEgo] resend traceback: {traceback.format_exc()}"
+                        )
+                        self._show_bulletin("Ошибка повторной отправки", "error")
+
+                run_on_ui_thread(_send_on_ui)
             except Exception as error:
                 self.log(f"[AlterEgo] resend failed: {error}")
                 self.log(f"[AlterEgo] resend traceback: {traceback.format_exc()}")
