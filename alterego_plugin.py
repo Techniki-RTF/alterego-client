@@ -8,6 +8,7 @@ __icon__ = "exteraPlugins/1"
 # endregion
 
 import random
+import math
 import threading
 import time
 import traceback
@@ -38,6 +39,8 @@ LONG_PRESS_DELAY_MS = 430
 STATUS_RETURN_DELAY_MS = 420
 STATUS_REFRESH_INTERVAL_MS = 5000
 MASK_TIMEOUT_SEC = 30
+DECODE_TIMEOUT_SEC = 5
+DECODE_TIME_MARKER = " 🔓"
 
 
 class StatusTouchHelper:
@@ -278,6 +281,50 @@ class FloatingDateTouchHook(MethodHook):
             self.plugin.log(f"[AlterEgo] FloatingDate touch hook failed: {error}")
 
 
+class ChatMessageBindHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            message_object = None
+            if param.args and len(param.args) > 0:
+                message_object = param.args[0]
+            if message_object is None:
+                message_object = get_private_field(
+                    param.thisObject, "currentMessageObject"
+                )
+            account = self.plugin._extract_account_from_cell(param.thisObject)
+            self.plugin._decode_message_object_async(
+                message_object, account, cell=param.thisObject
+            )
+        except Exception as error:
+            self.plugin.log(f"[AlterEgo] ChatMessage bind hook failed: {error}")
+
+
+class ChatMessageTimeHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._apply_decoded_time_icon(param.thisObject)
+        except Exception as error:
+            self.plugin.log(f"[AlterEgo] ChatMessage time hook failed: {error}")
+
+
+class ChatMessageDrawHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            canvas = param.args[0] if param.args and len(param.args) > 0 else None
+            self.plugin._draw_decoded_marker_on_canvas(param.thisObject, canvas)
+        except Exception:
+            pass
+
+
 # endregion
 
 
@@ -289,6 +336,9 @@ class AlterEgo(BasePlugin):
         self._chat_show_floating_date_unhooks = []
         self._chat_hide_floating_date_unhooks = []
         self._chat_action_touch_unhooks = []
+        self._chat_message_bind_unhooks = []
+        self._chat_message_time_unhooks = []
+        self._chat_message_draw_unhooks = []
         self._native_date_mode = {}
         self._last_scroll_activity_ms = {}
         self._status_cache = "API Unavailable"
@@ -302,8 +352,16 @@ class AlterEgo(BasePlugin):
         self._update_hook_ids = []
         self._request_hook_ids = []
         self._mask_cache = {}
+        self._decode_cache = {}
+        self._decoded_message_texts = {}
+        self._decode_in_flight = set()
+        self._decode_denied = {}
+        self._decode_recent_applied = {}
         self._bypass_text_counts = {}
         self._pending_stored_messages = []
+        self._pending_lock = threading.Lock()
+        self._status_refresh_lock = threading.Lock()
+        self._last_successful_send_at_ms = {}
         self._status_touch = StatusTouchHelper(self)
         self._floating_view = FloatingDateViewHelper(self)
         self._dialog_menu_item_id = None
@@ -314,6 +372,11 @@ class AlterEgo(BasePlugin):
             if not chat_activity_class:
                 self.log("[AlterEgo] ChatActivity class not found")
                 return
+
+            try:
+                self._register_dialog_toggle_menu()
+            except Exception as error:
+                self.log(f"[AlterEgo] Dialog menu item registration failed: {error}")
 
             self._chat_create_view_unhooks = (
                 self.hook_all_methods(
@@ -357,11 +420,67 @@ class AlterEgo(BasePlugin):
                     or []
                 )
 
+            try:
+                chat_message_cell_class = find_class(
+                    "org.telegram.ui.Cells.ChatMessageCell"
+                )
+                if chat_message_cell_class:
+                    bind_hooks = []
+                    for method_name in (
+                        "setMessageObject",
+                        "setMessageObjectInternal",
+                        "setMessageObjectInternal2",
+                    ):
+                        unhooks = (
+                            self.hook_all_methods(
+                                chat_message_cell_class,
+                                method_name,
+                                ChatMessageBindHook(self),
+                                priority=90,
+                            )
+                            or []
+                        )
+                        bind_hooks.extend(unhooks)
+                    self._chat_message_bind_unhooks = bind_hooks
+
+                    time_hooks = []
+                    for method_name in ("measureTime", "measureTimeForMessage"):
+                        unhooks = (
+                            self.hook_all_methods(
+                                chat_message_cell_class,
+                                method_name,
+                                ChatMessageTimeHook(self),
+                                priority=90,
+                            )
+                            or []
+                        )
+                        time_hooks.extend(unhooks)
+                    self._chat_message_time_unhooks = time_hooks
+
+                    draw_hooks = []
+                    for method_name in ("onDraw",):
+                        unhooks = (
+                            self.hook_all_methods(
+                                chat_message_cell_class,
+                                method_name,
+                                ChatMessageDrawHook(self),
+                                priority=90,
+                            )
+                            or []
+                        )
+                        draw_hooks.extend(unhooks)
+                    self._chat_message_draw_unhooks = draw_hooks
+            except Exception as error:
+                self.log(f"[AlterEgo] ChatMessage hooks failed: {error}")
+
             self.log(
                 f"[AlterEgo] Hooks active: createView={len(self._chat_create_view_unhooks)}, "
                 f"showFloatingDateView={len(self._chat_show_floating_date_unhooks)}, "
                 f"hideFloatingDateView={len(self._chat_hide_floating_date_unhooks)}, "
-                f"chatActionTouch={len(self._chat_action_touch_unhooks)}"
+                f"chatActionTouch={len(self._chat_action_touch_unhooks)}, "
+                f"chatMessageBind={len(self._chat_message_bind_unhooks)}, "
+                f"chatMessageTime={len(self._chat_message_time_unhooks)}, "
+                f"chatMessageDraw={len(self._chat_message_draw_unhooks)}"
             )
 
             try:
@@ -372,21 +491,22 @@ class AlterEgo(BasePlugin):
                 self.log(f"[AlterEgo] Send pipeline hook failed: {error}")
 
             try:
-                self._register_dialog_toggle_menu()
-            except Exception as error:
-                self.log(f"[AlterEgo] Dialog menu item registration failed: {error}")
-
-            try:
                 request_hook_names = [
                     "TL_messages_sendMessage",
                     "TL_messages_sendMedia",
                     "TL_messages_sendMultiMedia",
+                    "messages.sendMessage",
+                    "messages.sendMedia",
+                    "messages.sendMultiMedia",
+                    "sendMessage",
+                    "sendMedia",
+                    "sendMultiMedia",
                 ]
                 for hook_name in request_hook_names:
                     hook_id = self.add_hook(
                         hook_name, match_substring=True, priority=80
                     )
-                    if hook_id:
+                    if hook_id is not None:
                         self._request_hook_ids.append(hook_id)
                 self.log(
                     f"[AlterEgo] Request hooks registered: {len(self._request_hook_ids)}"
@@ -398,14 +518,27 @@ class AlterEgo(BasePlugin):
                 update_hook_names = [
                     "TL_updateNewMessage",
                     "TL_updateNewChannelMessage",
+                    "TL_updateShortSentMessage",
+                    "TL_updateShortMessage",
+                    "TL_updateShortChatMessage",
+                    "TL_updateEditMessage",
+                    "TL_updateEditChannelMessage",
+                    "updateShortSentMessage",
+                    "updateShortMessage",
+                    "updateNewMessage",
+                    "TL_update",
                     "updates",
+                    "TL_updates",
                     "updatesCombined",
+                    "TL_updatesCombined",
+                    "updateShort",
+                    "Updates",
                 ]
                 for hook_name in update_hook_names:
                     hook_id = self.add_hook(
                         hook_name, match_substring=True, priority=80
                     )
-                    if hook_id:
+                    if hook_id is not None:
                         self._update_hook_ids.append(hook_id)
                 self.log(
                     f"[AlterEgo] Update hooks registered: {len(self._update_hook_ids)}"
@@ -416,6 +549,38 @@ class AlterEgo(BasePlugin):
         except Exception as error:
             self.log(f"[AlterEgo] Hook setup failed: {error}")
             self.log(f"[AlterEgo] Hook setup traceback: {traceback.format_exc()}")
+
+    def on_plugin_unload(self):
+        for hook_obj in (
+            self._chat_create_view_unhooks
+            + self._chat_show_floating_date_unhooks
+            + self._chat_hide_floating_date_unhooks
+            + self._chat_action_touch_unhooks
+            + self._chat_message_bind_unhooks
+            + self._chat_message_time_unhooks
+            + self._chat_message_draw_unhooks
+        ):
+            try:
+                self.unhook_method(hook_obj)
+            except Exception as error:
+                self.log(f"[AlterEgo] unhook failed: {error}")
+
+        for hook_id in self._update_hook_ids + self._request_hook_ids:
+            try:
+                self.remove_hook(hook_id)
+            except Exception as error:
+                self.log(f"[AlterEgo] remove_hook({hook_id}) failed: {error}")
+
+        self._chat_create_view_unhooks = []
+        self._chat_show_floating_date_unhooks = []
+        self._chat_hide_floating_date_unhooks = []
+        self._chat_action_touch_unhooks = []
+        self._chat_message_bind_unhooks = []
+        self._chat_message_time_unhooks = []
+        self._chat_message_draw_unhooks = []
+        self._update_hook_ids = []
+        self._request_hook_ids = []
+        self._send_hook_registered = False
 
     # endregion
 
@@ -882,7 +1047,43 @@ class AlterEgo(BasePlugin):
                 return message
         except Exception:
             pass
+        try:
+            message_owner = getattr(update, "messageOwner")
+            if message_owner is not None:
+                return message_owner
+        except Exception:
+            pass
+        try:
+            message_owner = get_private_field(update, "messageOwner")
+            if message_owner is not None:
+                return message_owner
+        except Exception:
+            pass
+        try:
+            message_owner = update.getMessageOwner()
+            if message_owner is not None:
+                return message_owner
+        except Exception:
+            pass
         return None
+
+    @staticmethod
+    def _coerce_long_int(value):
+        if value is None:
+            return 0
+        try:
+            return int(value)
+        except Exception:
+            pass
+        for meth in ("longValue", "intValue"):
+            try:
+                return int(getattr(value, meth)())
+            except Exception:
+                pass
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return 0
 
     @staticmethod
     def _extract_update_message_fields(update):
@@ -891,6 +1092,8 @@ class AlterEgo(BasePlugin):
             "clientRandomId": 0,
             "messageId": 0,
             "dialogId": 0,
+            "senderTelegramId": 0,
+            "receivedAt": "",
             "text": "",
             "out": False,
         }
@@ -902,7 +1105,13 @@ class AlterEgo(BasePlugin):
         data["text"] = AlterEgo._extract_message_text(message)
         data["messageId"] = AlterEgo._extract_message_id(message)
         data["dialogId"] = AlterEgo._extract_dialog_id_from_message(message)
+        data["senderTelegramId"] = AlterEgo._extract_sender_user_id(message)
         data["out"] = False
+
+        received_at_ms = AlterEgo._extract_message_date_ms(message)
+        if received_at_ms <= 0:
+            received_at_ms = AlterEgo._extract_message_date_ms(update)
+        data["receivedAt"] = AlterEgo._to_utc_iso(received_at_ms)
 
         if message is not None:
             for attr in ("out", "isOut"):
@@ -913,25 +1122,39 @@ class AlterEgo(BasePlugin):
                 if isinstance(v, bool):
                     data["out"] = v
                     break
+                try:
+                    data["out"] = int(v) != 0
+                    break
+                except Exception:
+                    pass
 
-            try:
-                random_id = getattr(message, "random_id")
-            except Exception:
-                random_id = get_private_field(message, "random_id")
-            try:
-                data["clientRandomId"] = int(random_id)
-            except Exception:
-                pass
+            for attr in ("random_id", "randomId", "randomId64"):
+                rid = None
+                try:
+                    rid = getattr(message, attr)
+                except Exception:
+                    rid = get_private_field(message, attr)
+                coerced = AlterEgo._coerce_long_int(rid)
+                if coerced:
+                    data["clientRandomId"] = coerced
+                    break
 
         # Fallback for update types without nested Message object
         if data["messageId"] <= 0:
-            try:
-                data["messageId"] = int(getattr(update, "id"))
-            except Exception:
+            for attr in ("id", "message_id", "messageId"):
                 try:
-                    data["messageId"] = int(get_private_field(update, "id"))
+                    data["messageId"] = AlterEgo._coerce_long_int(getattr(update, attr))
+                    if data["messageId"] > 0:
+                        break
                 except Exception:
-                    pass
+                    try:
+                        data["messageId"] = AlterEgo._coerce_long_int(
+                            get_private_field(update, attr)
+                        )
+                        if data["messageId"] > 0:
+                            break
+                    except Exception:
+                        continue
 
         if not data["text"]:
             try:
@@ -942,13 +1165,22 @@ class AlterEgo(BasePlugin):
                 data["text"] = maybe_text
 
         if data["clientRandomId"] == 0:
-            try:
-                data["clientRandomId"] = int(getattr(update, "random_id"))
-            except Exception:
+            for attr in ("random_id", "randomId", "randomId64"):
                 try:
-                    data["clientRandomId"] = int(get_private_field(update, "random_id"))
+                    data["clientRandomId"] = AlterEgo._coerce_long_int(
+                        getattr(update, attr)
+                    )
+                    if data["clientRandomId"]:
+                        break
                 except Exception:
-                    pass
+                    try:
+                        data["clientRandomId"] = AlterEgo._coerce_long_int(
+                            get_private_field(update, attr)
+                        )
+                        if data["clientRandomId"]:
+                            break
+                    except Exception:
+                        continue
 
         if data["dialogId"] == 0:
             # Common shape for TL_updateShortSentMessage
@@ -958,17 +1190,6 @@ class AlterEgo(BasePlugin):
                     data["dialogId"] = user_id
             except Exception:
                 pass
-
-        if data["dialogId"] == 0:
-            peer = None
-            for attr in ("peer", "peer_id", "peerId"):
-                try:
-                    peer = getattr(update, attr)
-                except Exception:
-                    peer = get_private_field(update, attr)
-                if peer is not None:
-                    break
-            data["dialogId"] = AlterEgo._extract_dialog_id_from_peer(peer)
 
         if data["dialogId"] == 0:
             peer = None
@@ -998,6 +1219,21 @@ class AlterEgo(BasePlugin):
             data["pendingRequestId"] = int(pending)
         except Exception:
             pass
+
+        if not data["out"]:
+            for attr in ("out", "isOut"):
+                try:
+                    v = getattr(update, attr)
+                except Exception:
+                    v = get_private_field(update, attr)
+                if isinstance(v, bool):
+                    data["out"] = v
+                    break
+                try:
+                    data["out"] = int(v) != 0
+                    break
+                except Exception:
+                    pass
 
         return data
 
@@ -1030,6 +1266,271 @@ class AlterEgo(BasePlugin):
             except Exception:
                 continue
         return 0
+
+    @staticmethod
+    def _extract_message_date_ms(obj):
+        if obj is None:
+            return 0
+        for attr in ("date", "date_ms", "dateMs"):
+            try:
+                value = getattr(obj, attr)
+            except Exception:
+                value = get_private_field(obj, attr)
+            try:
+                value_int = int(value)
+                if value_int <= 0:
+                    continue
+                if value_int < 100000000000:
+                    return value_int * 1000
+                return value_int
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
+    def _to_utc_iso(timestamp_ms):
+        try:
+            if int(timestamp_ms) <= 0:
+                return ""
+            dt = datetime.fromtimestamp(int(timestamp_ms) / 1000.0, tz=timezone.utc)
+            return dt.isoformat()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _set_message_text(message, text):
+        if message is None or not isinstance(text, str):
+            return False
+        for attr in ("message", "text"):
+            try:
+                setattr(message, attr, text)
+                return True
+            except Exception:
+                pass
+            try:
+                if set_private_field(message, attr, text):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _get_message_time_text(cell):
+        if cell is None:
+            return ""
+        for attr in ("currentTimeString", "timeText", "timeString"):
+            try:
+                value = getattr(cell, attr)
+            except Exception:
+                value = get_private_field(cell, attr)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    @staticmethod
+    def _set_message_time_text(cell, text):
+        if cell is None or not isinstance(text, str):
+            return False
+        for attr in ("currentTimeString", "timeText", "timeString"):
+            try:
+                setattr(cell, attr, text)
+                return True
+            except Exception:
+                pass
+            try:
+                if set_private_field(cell, attr, text):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _mark_message_decoded(message):
+        if message is None:
+            return
+        try:
+            setattr(message, "alterEgoDecoded", True)
+            return
+        except Exception:
+            pass
+        try:
+            set_private_field(message, "alterEgoDecoded", True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _set_object_text_fields(obj, text):
+        if obj is None or not isinstance(text, str):
+            return False
+        changed = False
+        for attr in (
+            "message",
+            "text",
+            "messageText",
+            "messageTextString",
+        ):
+            try:
+                setattr(obj, attr, text)
+                changed = True
+                continue
+            except Exception:
+                pass
+            try:
+                if set_private_field(obj, attr, text):
+                    changed = True
+            except Exception:
+                pass
+        return changed
+
+    @staticmethod
+    def _is_message_marked_decoded(message):
+        if message is None:
+            return False
+        for attr in ("alterEgoDecoded",):
+            try:
+                value = getattr(message, attr)
+            except Exception:
+                value = get_private_field(message, attr)
+            if value is True:
+                return True
+        return False
+
+    @staticmethod
+    def _rebuild_time_layout_for_cell(cell, time_text):
+        if cell is None or not isinstance(time_text, str) or not time_text:
+            return False
+        try:
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+            StaticLayout = jclass("android.text.StaticLayout")
+            Alignment = jclass("android.text.Layout$Alignment")
+            paint = getattr(Theme, "chat_timePaint")
+            if paint is None:
+                return False
+            width = int(
+                math.ceil(float(paint.measureText(time_text, 0, len(time_text))))
+            )
+            layout = StaticLayout(
+                time_text,
+                paint,
+                int(width + 100),
+                getattr(Alignment, "ALIGN_NORMAL"),
+                1.0,
+                0.0,
+                False,
+            )
+            set_private_field(cell, "timeTextWidth", int(width))
+            set_private_field(cell, "timeWidth", int(width))
+            set_private_field(cell, "timeLayout", layout)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _get_time_draw_position(cell):
+        if cell is None:
+            return None
+        try:
+            x = float(get_private_field(cell, "drawTimeX"))
+            y = float(get_private_field(cell, "drawTimeY"))
+            if x == 0 and y == 0:
+                return None
+            return x, y
+        except Exception:
+            return None
+
+    @staticmethod
+    def _get_theme_time_paint():
+        try:
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+            return getattr(Theme, "chat_timePaint")
+        except Exception:
+            return None
+
+    def _draw_decoded_marker_on_canvas(self, cell, canvas):
+        if cell is None or canvas is None:
+            return
+
+        message_object = None
+        try:
+            message_object = get_private_field(cell, "currentMessageObject")
+        except Exception:
+            return
+        message = self._extract_message_from_update(message_object)
+        if message is None:
+            return
+
+        dialog_id = self._extract_dialog_id_from_message(message)
+        message_id = self._extract_message_id(message)
+        if not dialog_id or message_id <= 0:
+            return
+        if (int(dialog_id), int(message_id)) not in self._decoded_message_texts:
+            return
+
+        position = self._get_time_draw_position(cell)
+        if position is None:
+            return
+        draw_x, draw_y = position
+
+        paint = self._get_theme_time_paint()
+        if paint is None:
+            return
+
+        marker = "🔓"
+        try:
+            layout = get_private_field(cell, "timeLayout")
+            line_width = 0.0
+            if layout is not None and hasattr(layout, "getLineWidth"):
+                line_width = float(layout.getLineWidth(0))
+            marker_x = draw_x + line_width + 4.0
+            marker_y = (
+                draw_y + float(layout.getHeight()) - 2.0
+                if layout is not None
+                else draw_y
+            )
+            canvas.drawText(marker, marker_x, marker_y, paint)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _refresh_cell_layout(cell):
+        if cell is None:
+            return
+        try:
+            if hasattr(cell, "requestLayout"):
+                cell.requestLayout()
+            if hasattr(cell, "invalidate"):
+                cell.invalidate()
+        except Exception:
+            pass
+
+    def _apply_decoded_text_to_entities(self, message_object, message, text):
+        changed = False
+
+        if self._set_message_text(message, text):
+            changed = True
+        if self._set_object_text_fields(message, text):
+            changed = True
+
+        if message_object is not None and message_object is not message:
+            if self._set_object_text_fields(message_object, text):
+                changed = True
+
+        self._mark_message_decoded(message)
+        if message_object is not None and message_object is not message:
+            self._mark_message_decoded(message_object)
+
+        try:
+            if message is not None and hasattr(message, "resetLayout"):
+                message.resetLayout()
+        except Exception:
+            pass
+        try:
+            if message_object is not None and hasattr(message_object, "resetLayout"):
+                message_object.resetLayout()
+        except Exception:
+            pass
+
+        return changed
 
     @staticmethod
     def _extract_dialog_id_from_message(message):
@@ -1169,6 +1670,15 @@ class AlterEgo(BasePlugin):
         )
         self._dialog_menu_item_id = self.add_menu_item(item)
 
+    def _clear_decoded_for_dialog(self, dialog_id):
+        if not dialog_id:
+            return
+        did = int(dialog_id)
+        for d in (self._decoded_message_texts, self._decode_denied, self._decode_recent_applied, self._decode_cache):
+            keys = [k for k in d if (k[0] if isinstance(k, tuple) else None) == did]
+            for k in keys:
+                d.pop(k, None)
+
     def _toggle_dialog_menu(self, context):
         dialog_id = self._extract_dialog_id_from_context(context)
         if not dialog_id:
@@ -1194,6 +1704,7 @@ class AlterEgo(BasePlugin):
             self._show_bulletin("Alter Ego включен для диалога", "success")
         else:
             self._show_bulletin("Alter Ego выключен для диалога", "info")
+            self._clear_decoded_for_dialog(dialog_id)
 
     @staticmethod
     def _extract_sender_user_id(message):
@@ -1273,6 +1784,16 @@ class AlterEgo(BasePlugin):
             return False
 
         dialog_id = self._extract_dialog_id_from_message(message)
+        pending_dialog_ids = set()
+        for pending_item in self._pending_stored_messages:
+            pending_dialog = int(pending_item.get("dialogId") or 0)
+            if pending_dialog:
+                pending_dialog_ids.add(pending_dialog)
+        if dialog_id and pending_dialog_ids and dialog_id not in pending_dialog_ids:
+            return False
+        self.log(
+            f"[AlterEgo][store/msg] incoming: dialog={dialog_id}, messageId={message_id}, text='{text[:80]}', pending={len(self._pending_stored_messages)}"
+        )
 
         now = self._now_ms()
         matched_index = -1
@@ -1308,8 +1829,21 @@ class AlterEgo(BasePlugin):
                 break
 
         if matched_index < 0:
+            pending_snapshot = []
+            for item in self._pending_stored_messages[-3:]:
+                item_created = int(item.get("createdAtMs") or 0)
+                item_age_ms = now - item_created if item_created else -1
+                pending_snapshot.append(
+                    {
+                        "dialog": int(item.get("dialogId") or 0),
+                        "randomId": int(item.get("clientRandomId") or 0),
+                        "pendingReqId": int(item.get("pendingRequestId") or 0),
+                        "ageMs": item_age_ms,
+                        "cover": str(item.get("coverText") or "")[:40],
+                    }
+                )
             self.log(
-                f"[AlterEgo] no pending match: text='{text[:80]}', dialog={dialog_id}, pending={len(self._pending_stored_messages)}"
+                f"[AlterEgo] no pending match: text='{text[:80]}', dialog={dialog_id}, pending={len(self._pending_stored_messages)}, snapshot={pending_snapshot}"
             )
             return False
 
@@ -1327,6 +1861,7 @@ class AlterEgo(BasePlugin):
         if text.strip() != cover_text.strip():
             return False
 
+        created_at = self._to_utc_iso(self._extract_message_date_ms(message))
         run_on_queue(
             lambda: self._store_message_sync(
                 normalized,
@@ -1334,6 +1869,7 @@ class AlterEgo(BasePlugin):
                 message_id,
                 original_text,
                 cover_text,
+                created_at,
             )
         )
         self.log(
@@ -1356,6 +1892,38 @@ class AlterEgo(BasePlugin):
         random_id = int(fields.get("clientRandomId") or 0)
         text = fields.get("text") or ""
         current_user_id = self._extract_current_user_id(account)
+        is_outgoing = bool(fields.get("out"))
+        sender_telegram_id = int(fields.get("senderTelegramId") or 0)
+        pending_dialog_ids = set()
+        for pending_item in self._pending_stored_messages:
+            pending_dialog = int(pending_item.get("dialogId") or 0)
+            if pending_dialog:
+                pending_dialog_ids.add(pending_dialog)
+        if dialog_id and pending_dialog_ids and dialog_id not in pending_dialog_ids:
+            return False
+        self.log(
+            f"[AlterEgo][store/update] incoming: dialog={dialog_id}, messageId={message_id}, randomId={random_id}, pendingReqId={pending_req_id}, out={is_outgoing}, sender={sender_telegram_id}, currentUser={current_user_id}, text='{str(text)[:80]}', pending={len(self._pending_stored_messages)}"
+        )
+
+        # Ignore updates for dialogs where plugin is disabled.
+        if dialog_id and not self._is_dialog_enabled(dialog_id):
+            return False
+
+        # For storing sent messages we trust only outgoing updates (or updates
+        # with sender equal to current account user). This prevents binding to
+        # foreign updates from other dialogs/accounts.
+        if current_user_id and sender_telegram_id and sender_telegram_id != current_user_id:
+            if not is_outgoing:
+                return False
+
+        # Some short-sent update variants do not expose dialog/sender/out flags.
+        # Trust such updates only shortly after a successful send request.
+        if dialog_id == 0 and not is_outgoing and sender_telegram_id == 0:
+            recent_send_at = int(self._last_successful_send_at_ms.get(int(account)) or 0)
+            if not recent_send_at or self._now_ms() - recent_send_at > 30000:
+                return False
+            if not isinstance(text, str) or not text.strip():
+                return False
 
         now = self._now_ms()
         matched_index = -1
@@ -1380,6 +1948,20 @@ class AlterEgo(BasePlugin):
                     )
                     break
 
+        if matched_index < 0 and len(self._pending_stored_messages) == 1:
+            if is_outgoing and message_id > 0:
+                single = self._pending_stored_messages[0]
+                created_at = int(single.get("createdAtMs") or 0)
+                item_dialog = int(single.get("dialogId") or 0)
+                if created_at and now - created_at <= 15000:
+                    if dialog_id == 0 or (
+                        item_dialog and dialog_id == item_dialog
+                    ):
+                        matched_index = 0
+                        self.log(
+                            "[AlterEgo] pending match by outgoing-rpc (single pending, meta incomplete)"
+                        )
+
         if matched_index < 0:
             # For short-sent updates with no random/pending ids,
             # match by account+dialog and nearest timestamp.
@@ -1391,6 +1973,17 @@ class AlterEgo(BasePlugin):
                 item_dialog = int(item.get("dialogId") or 0)
                 if dialog_id and item_dialog and dialog_id != item_dialog:
                     continue
+                if not dialog_id:
+                    # If update doesn't provide dialog id, require exact text match
+                    # to avoid binding to unrelated outgoing updates.
+                    item_cover = item.get("coverText") or ""
+                    if (
+                        not isinstance(text, str)
+                        or not text.strip()
+                        or not isinstance(item_cover, str)
+                        or item_cover.strip() != text.strip()
+                    ):
+                        continue
                 item_account = int(item.get("account") or 0)
                 if current_user_id and item_account and current_user_id != item_account:
                     continue
@@ -1418,9 +2011,27 @@ class AlterEgo(BasePlugin):
                     matched_index = idx
                     break
 
+        # Do not use ambiguous last-resort fallback here:
+        # it can bind pending entry to an unrelated outgoing update and produce
+        # wrong telegramMessageId (e.g. tiny local IDs like 76).
+
         if matched_index < 0:
+            pending_snapshot = []
+            for item in self._pending_stored_messages[-3:]:
+                item_created = int(item.get("createdAtMs") or 0)
+                item_age_ms = now - item_created if item_created else -1
+                pending_snapshot.append(
+                    {
+                        "account": int(item.get("account") or 0),
+                        "dialog": int(item.get("dialogId") or 0),
+                        "randomId": int(item.get("clientRandomId") or 0),
+                        "pendingReqId": int(item.get("pendingRequestId") or 0),
+                        "ageMs": item_age_ms,
+                        "cover": str(item.get("coverText") or "")[:40],
+                    }
+                )
             self.log(
-                f"[AlterEgo] no raw-update pending match: msgId={message_id}, dialog={dialog_id}, randomId={random_id}, pendingReqId={pending_req_id}, pending={len(self._pending_stored_messages)}"
+                f"[AlterEgo] no raw-update pending match: msgId={message_id}, dialog={dialog_id}, randomId={random_id}, pendingReqId={pending_req_id}, pending={len(self._pending_stored_messages)}, snapshot={pending_snapshot}"
             )
 
         if matched_index < 0:
@@ -1439,6 +2050,7 @@ class AlterEgo(BasePlugin):
         if not isinstance(cover_text, str) or not cover_text.strip():
             return False
 
+        created_at = fields.get("receivedAt") or ""
         run_on_queue(
             lambda: self._store_message_sync(
                 normalized,
@@ -1446,6 +2058,7 @@ class AlterEgo(BasePlugin):
                 message_id,
                 original_text,
                 cover_text,
+                created_at,
             )
         )
         self.log(
@@ -1461,6 +2074,7 @@ class AlterEgo(BasePlugin):
         api_base_url,
         source_text,
         source_params,
+        resolved_dialog_id=0,
     ):
         if not isinstance(masked_text, str) or not masked_text.strip():
             return
@@ -1543,7 +2157,7 @@ class AlterEgo(BasePlugin):
                             f"[AlterEgo] resend done with keys={sorted(list(resend_param_keys))}"
                         )
 
-                        dialog_id = params_meta.get("peer")
+                        dialog_id = int(resolved_dialog_id) if resolved_dialog_id else 0
                         self._pending_stored_messages.append(
                             {
                                 "account": self._extract_current_user_id(account),
@@ -1561,6 +2175,7 @@ class AlterEgo(BasePlugin):
                                 ),
                             }
                         )
+                        self._last_successful_send_at_ms[int(account)] = self._now_ms()
                         self.log(
                             f"[AlterEgo] pending added: dialog={int(dialog_id) if isinstance(dialog_id, int) else 0}, pendingReqId={int(params_meta.get('pendingRequestId') or 0)}, randomId={int(params_meta.get('clientRandomId') or 0)}, cover='{masked_text[:80]}'"
                         )
@@ -1635,9 +2250,14 @@ class AlterEgo(BasePlugin):
         return True, cover_text, ""
 
     def _store_message_sync(
-        self, api_base_url, dialog_id, telegram_message_id, source_text, cover_text
+        self,
+        api_base_url,
+        dialog_id,
+        telegram_message_id,
+        source_text,
+        cover_text,
+        created_at="",
     ):
-        headers = self._auth_headers(api_base_url)
         payload = {
             "dialogId": int(dialog_id) if isinstance(dialog_id, int) else 0,
             "telegramMessageId": int(telegram_message_id)
@@ -1645,11 +2265,17 @@ class AlterEgo(BasePlugin):
             else 0,
             "originalText": source_text,
             "coverText": cover_text,
-            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "createdAt": created_at
+            if isinstance(created_at, str) and created_at.strip()
+            else datetime.now(timezone.utc).isoformat(),
         }
+        self.log(
+            f"[AlterEgo][store/api] POST /api/Messages payload: dialogId={payload['dialogId']}, telegramMessageId={payload['telegramMessageId']}, createdAt={payload['createdAt']}, originalLen={len(str(payload.get('originalText') or ''))}, coverLen={len(str(payload.get('coverText') or ''))}"
+        )
 
         last_error = ""
         for attempt in range(3):
+            headers = self._auth_headers(api_base_url)
             try:
                 response = requests.post(
                     f"{api_base_url}/api/Messages",
@@ -1666,8 +2292,28 @@ class AlterEgo(BasePlugin):
                 return
 
             self.log(
-                f"[AlterEgo] store message status: {response.status_code}, dialog_id={payload['dialogId']}, message_id={payload['telegramMessageId']}"
+                f"[AlterEgo] store message status: {response.status_code}, dialog_id={payload['dialogId']}, message_id={payload['telegramMessageId']}, attempt={attempt + 1}"
             )
+            if response.status_code == 401:
+                if attempt < 2:
+                    self._auth_access_token = ""
+                    if self._login_sync(api_base_url):
+                        continue
+                server_message = self._extract_server_message(
+                    response, "Store message failed"
+                )
+                self.log(
+                    f"[AlterEgo][store/api] client error: status=401, message={server_message}"
+                )
+                return
+            if response.status_code >= 400 and response.status_code < 500:
+                server_message = self._extract_server_message(
+                    response, "Store message failed"
+                )
+                self.log(
+                    f"[AlterEgo][store/api] client error: status={response.status_code}, message={server_message}"
+                )
+                return
             if response.status_code >= 500:
                 last_error = self._extract_server_message(
                     response, "Store message failed"
@@ -1676,6 +2322,500 @@ class AlterEgo(BasePlugin):
                     time.sleep(0.35)
                     continue
             return
+
+    def _decode_by_message_id_sync(
+        self,
+        api_base_url,
+        dialog_id,
+        telegram_message_id,
+        sender_telegram_id,
+        received_at,
+    ):
+        if int(dialog_id) >= 0:
+            return False, ""
+
+        if int(telegram_message_id) <= 0:
+            return False, ""
+
+        headers = self._auth_headers(api_base_url)
+        try:
+            response = requests.get(
+                f"{api_base_url}/api/Messages/{int(dialog_id)}/{int(telegram_message_id)}",
+                headers=headers,
+                timeout=DECODE_TIMEOUT_SEC,
+            )
+        except Exception:
+            return False, ""
+
+        if response.status_code != 200:
+            return False, ""
+
+        try:
+            payload = response.json() if response.content else {}
+        except Exception:
+            return False, ""
+
+        if isinstance(payload, dict):
+            original_text = payload.get("originalText")
+            if isinstance(original_text, str) and original_text.strip():
+                return True, original_text.strip()
+        return False, ""
+
+    def _decode_private_sync(
+        self, api_base_url, dialog_id, sender_telegram_id, cover_text, received_at
+    ):
+        if not dialog_id:
+            self.log("[AlterEgo] decode_private skip: no dialog_id")
+            return False, ""
+        if int(sender_telegram_id) <= 0:
+            self.log(f"[AlterEgo] decode_private skip: sender={sender_telegram_id}")
+            return False, ""
+        if not isinstance(cover_text, str) or not cover_text.strip():
+            self.log("[AlterEgo] decode_private skip: empty cover_text")
+            return False, ""
+
+        headers = self._auth_headers(api_base_url)
+        payload = {
+            "dialogId": int(dialog_id),
+            "coverText": cover_text,
+            "receivedAt": received_at if isinstance(received_at, str) and received_at.strip() else datetime.now(timezone.utc).isoformat(),
+        }
+
+        self.log(f"[AlterEgo] decode_private POST: dialog={int(dialog_id)}, sender={int(sender_telegram_id)}, receivedAt={received_at!r}")
+        try:
+            response = requests.post(
+                f"{api_base_url}/api/Messages/decode",
+                json=payload,
+                headers=headers,
+                timeout=DECODE_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            self.log(f"[AlterEgo] decode_private request failed: {e}")
+            return False, ""
+
+        self.log(f"[AlterEgo] decode_private response: status={response.status_code}, body={response.text[:200]!r}")
+        if response.status_code != 200:
+            return False, ""
+
+        try:
+            data = response.json() if response.content else {}
+        except Exception:
+            return False, ""
+
+        if isinstance(data, dict):
+            original_text = data.get("originalText")
+            if isinstance(original_text, str) and original_text.strip():
+                return True, original_text.strip()
+        return False, ""
+
+    def _decode_message_text_sync(
+        self,
+        api_base_url,
+        dialog_id,
+        telegram_message_id,
+        sender_telegram_id,
+        cover_text,
+        received_at,
+    ):
+        self.log(
+            f"[AlterEgo] decode try dialog={int(dialog_id)}, messageId={int(telegram_message_id)}, sender={int(sender_telegram_id)}"
+        )
+        ok, original = self._decode_by_message_id_sync(
+            api_base_url,
+            dialog_id,
+            telegram_message_id,
+            sender_telegram_id,
+            received_at,
+        )
+        if ok:
+            return True, original
+
+        return self._decode_private_sync(
+            api_base_url,
+            dialog_id,
+            sender_telegram_id,
+            cover_text,
+            received_at,
+        )
+
+    def _remember_decode_cache(self, key, value):
+        if not isinstance(value, str) or not value.strip():
+            return
+        self._decode_cache[key] = value
+        if len(self._decode_cache) > 700:
+            try:
+                oldest_key = next(iter(self._decode_cache.keys()))
+                self._decode_cache.pop(oldest_key, None)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _extract_account_from_cell(cell):
+        if cell is None:
+            return 0
+        for attr in ("currentAccount", "account"):
+            try:
+                value = getattr(cell, attr)
+            except Exception:
+                value = get_private_field(cell, attr)
+            try:
+                return int(value)
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
+    def _extract_dialog_id_from_cell(cell):
+        if cell is None:
+            return 0
+        for attr in ("currentDialogId", "dialogId", "dialog_id"):
+            try:
+                value = getattr(cell, attr)
+            except Exception:
+                value = get_private_field(cell, attr)
+            try:
+                value_int = int(value)
+                if value_int:
+                    return value_int
+            except Exception:
+                continue
+        return 0
+
+    def _cache_decoded_message(self, dialog_id, message_id, original_text):
+        key = (int(dialog_id), int(message_id))
+        self._decoded_message_texts[key] = original_text
+        if len(self._decoded_message_texts) > 1200:
+            try:
+                oldest_key = next(iter(self._decoded_message_texts.keys()))
+                self._decoded_message_texts.pop(oldest_key, None)
+            except Exception:
+                pass
+
+    def _remember_decode_denied(self, dialog_id, message_id):
+        self._decode_denied[(int(dialog_id), int(message_id))] = self._now_ms()
+        if len(self._decode_denied) > 1200:
+            try:
+                oldest_key = next(iter(self._decode_denied.keys()))
+                self._decode_denied.pop(oldest_key, None)
+            except Exception:
+                pass
+
+    def _is_decode_denied_recently(self, dialog_id, message_id):
+        key = (int(dialog_id), int(message_id))
+        last = int(self._decode_denied.get(key) or 0)
+        return bool(last and self._now_ms() - last < 180000)
+
+    def _mark_decode_recently_applied(self, dialog_id, message_id):
+        key = (int(dialog_id), int(message_id))
+        self._decode_recent_applied[key] = self._now_ms()
+        if len(self._decode_recent_applied) > 1500:
+            try:
+                oldest_key = next(iter(self._decode_recent_applied.keys()))
+                self._decode_recent_applied.pop(oldest_key, None)
+            except Exception:
+                pass
+
+    def _is_decode_recently_applied(self, dialog_id, message_id):
+        key = (int(dialog_id), int(message_id))
+        last = int(self._decode_recent_applied.get(key) or 0)
+        return bool(last and self._now_ms() - last < 900)
+
+    def _apply_decoded_time_icon(self, cell):
+        message_object = None
+        try:
+            message_object = get_private_field(cell, "currentMessageObject")
+        except Exception:
+            return
+        if message_object is None:
+            return
+
+        message = self._extract_message_from_update(message_object)
+        dialog_id = self._extract_dialog_id_from_message(message)
+        message_id = self._extract_message_id(message)
+        if not dialog_id or message_id <= 0:
+            current_time = self._get_message_time_text(cell)
+            if isinstance(current_time, str) and current_time.endswith(
+                DECODE_TIME_MARKER
+            ):
+                self._set_message_time_text(
+                    cell, current_time[: -len(DECODE_TIME_MARKER)]
+                )
+            return
+
+        if not self._is_dialog_enabled(dialog_id) or (int(dialog_id), int(message_id)) not in self._decoded_message_texts:
+            current_time = self._get_message_time_text(cell)
+            if isinstance(current_time, str) and current_time.endswith(
+                DECODE_TIME_MARKER
+            ):
+                self._set_message_time_text(
+                    cell, current_time[: -len(DECODE_TIME_MARKER)]
+                )
+            return
+
+        current_time = self._get_message_time_text(cell)
+        if not isinstance(current_time, str) or not current_time:
+            return
+        if current_time.endswith(DECODE_TIME_MARKER):
+            return
+        updated = f"{current_time}{DECODE_TIME_MARKER}"
+        self._set_message_time_text(cell, updated)
+        self._rebuild_time_layout_for_cell(cell, updated)
+
+    def _decode_message_object_async(self, message_object, account, cell=None):
+        message = self._extract_message_from_update(message_object)
+        if message is None:
+            return
+
+        dialog_id = self._extract_dialog_id_from_message(message)
+        if not dialog_id and cell is not None:
+            dialog_id = self._extract_dialog_id_from_cell(cell)
+        if (
+            not dialog_id
+            and message_object is not None
+            and message_object is not message
+        ):
+            dialog_id = self._extract_dialog_id_from_message(message_object)
+        if not dialog_id or not self._is_dialog_enabled(dialog_id):
+            return
+
+        sender_telegram_id = self._extract_sender_user_id(message)
+        current_user_id = self._extract_current_user_id(account)
+        if current_user_id and (
+            not sender_telegram_id or sender_telegram_id <= 0
+        ) and self._is_outgoing_message(message, account):
+            sender_telegram_id = current_user_id
+
+        cover_text = self._extract_message_text(message)
+        if not isinstance(cover_text, str) or not cover_text.strip():
+            return
+
+        message_id = self._extract_message_id(message)
+        if (
+            message_id <= 0
+            and message_object is not None
+            and message_object is not message
+        ):
+            message_id = self._extract_message_id(message_object)
+        if message_id <= 0:
+            return
+
+        if self._is_decode_recently_applied(dialog_id, message_id):
+            if cell is not None:
+                self._apply_decoded_time_icon(cell)
+            return
+
+        decoded_key = (int(dialog_id), int(message_id))
+        cached_text = self._decoded_message_texts.get(decoded_key)
+        if isinstance(cached_text, str) and cached_text.strip():
+            current_text = self._extract_message_text(message)
+            already_decoded = self._is_message_marked_decoded(message)
+            needs_apply = not (
+                isinstance(current_text, str)
+                and current_text.strip() == cached_text.strip()
+                and already_decoded
+            )
+            if needs_apply and self._apply_decoded_text_to_entities(
+                message_object, message, cached_text
+            ):
+                self._mark_decode_recently_applied(dialog_id, message_id)
+                if cell is not None:
+                    self._apply_decoded_time_icon(cell)
+                    self._refresh_cell_layout(cell)
+            elif cell is not None:
+                self._apply_decoded_time_icon(cell)
+            return
+
+        decode_key = (
+            int(dialog_id),
+            int(message_id),
+            int(sender_telegram_id),
+            cover_text.strip(),
+        )
+        if decode_key in self._decode_in_flight:
+            return
+
+        if self._is_decode_denied_recently(dialog_id, message_id):
+            return
+
+        cached = self._decode_cache.get(decode_key)
+        if isinstance(cached, str) and cached.strip():
+            current_text = self._extract_message_text(message)
+            already_decoded = self._is_message_marked_decoded(message)
+            needs_apply = not (
+                isinstance(current_text, str)
+                and current_text.strip() == cached.strip()
+                and already_decoded
+            )
+            if needs_apply and self._apply_decoded_text_to_entities(
+                message_object, message, cached
+            ):
+                self._cache_decoded_message(dialog_id, message_id, cached)
+                self._mark_decode_recently_applied(dialog_id, message_id)
+                if cell is not None:
+                    self._apply_decoded_time_icon(cell)
+                    self._refresh_cell_layout(cell)
+            elif cell is not None:
+                self._apply_decoded_time_icon(cell)
+            return
+
+        api_url = self.get_setting("api_url", "")
+        if not isinstance(api_url, str) or not self._is_url(api_url):
+            return
+
+        received_at = self._to_utc_iso(self._extract_message_date_ms(message))
+        self._decode_in_flight.add(decode_key)
+
+        def _worker():
+            try:
+                success, original_text = self._decode_message_text_sync(
+                    api_url.rstrip("/"),
+                    dialog_id,
+                    message_id,
+                    sender_telegram_id,
+                    cover_text,
+                    received_at,
+                )
+                if (
+                    not success
+                    or not isinstance(original_text, str)
+                    or not original_text.strip()
+                ):
+                    self.log(
+                        f"[AlterEgo] decode miss dialog={dialog_id}, messageId={message_id}, sender={sender_telegram_id}"
+                    )
+                    self._remember_decode_denied(dialog_id, message_id)
+                    return
+
+                self._remember_decode_cache(decode_key, original_text)
+                self._cache_decoded_message(dialog_id, message_id, original_text)
+                self.log(
+                    f"[AlterEgo] decoded dialog={dialog_id}, messageId={message_id}, sender={sender_telegram_id}"
+                )
+
+                def _apply():
+                    try:
+                        if self._apply_decoded_text_to_entities(
+                            message_object, message, original_text
+                        ):
+                            self._mark_decode_recently_applied(dialog_id, message_id)
+                            if cell is not None:
+                                self._apply_decoded_time_icon(cell)
+                                self._refresh_cell_layout(cell)
+                    except Exception:
+                        pass
+
+                run_on_ui_thread(_apply)
+            finally:
+                self._decode_in_flight.discard(decode_key)
+
+        run_on_queue(_worker)
+
+    def _try_decode_message_from_update(self, update, account):
+        message = self._extract_message_from_update(update)
+        if message is None:
+            return False
+        self._decode_message_object_async(message, account)
+        return False
+
+    @staticmethod
+    def _java_collection_to_list(seq):
+        if seq is None:
+            return []
+        try:
+            size = int(seq.size())
+            return [seq.get(i) for i in range(size)]
+        except Exception:
+            try:
+                return list(seq)
+            except Exception:
+                return []
+
+    @staticmethod
+    def _iter_updates_like_items(obj):
+        if obj is None:
+            return []
+        items = []
+        updates = None
+        try:
+            updates = getattr(obj, "updates", None)
+        except Exception:
+            updates = None
+        if updates is None:
+            try:
+                updates = get_private_field(obj, "updates")
+            except Exception:
+                updates = None
+        if updates is not None:
+            items.extend(AlterEgo._java_collection_to_list(updates))
+        for attr in ("messages", "new_messages", "sent_messages"):
+            child = None
+            try:
+                child = getattr(obj, attr, None)
+            except Exception:
+                pass
+            if child is None:
+                try:
+                    child = get_private_field(obj, attr)
+                except Exception:
+                    child = None
+            if child is not None:
+                items.extend(AlterEgo._java_collection_to_list(child))
+        if items:
+            return items
+        return [obj]
+
+    def post_request_hook(
+        self, request_name: str, account: int, response: Any, error: Any
+    ) -> HookResult:
+        try:
+            if not self._pending_stored_messages:
+                return HookResult(strategy=HookStrategy.DEFAULT, response=response, error=error)
+            if not isinstance(request_name, str):
+                return HookResult(strategy=HookStrategy.DEFAULT, response=response, error=error)
+
+            request_name_lower = request_name.lower()
+            if (
+                "sendmessage" not in request_name_lower
+                and "sendmedia" not in request_name_lower
+                and "sendmultimedia" not in request_name_lower
+            ):
+                return HookResult(strategy=HookStrategy.DEFAULT, response=response, error=error)
+
+            self.log(
+                f"[AlterEgo] post_request_hook incoming: request={request_name}, hasError={error is not None}, pending={len(self._pending_stored_messages)}"
+            )
+            if error is None:
+                self._last_successful_send_at_ms[int(account)] = self._now_ms()
+
+            stored = False
+            for item in self._iter_updates_like_items(response):
+                if self._try_store_pending_from_update(item, account):
+                    self.log(
+                        f"[AlterEgo] post_request_hook stored pending from {request_name}"
+                    )
+                    stored = True
+                    break
+                message = self._extract_message_from_update(item)
+                if self._try_store_pending_from_message(message):
+                    self.log(
+                        f"[AlterEgo] post_request_hook stored pending(message) from {request_name}"
+                    )
+                    stored = True
+                    break
+            if not stored and self._pending_stored_messages:
+                if self._try_store_pending_from_update(response, account):
+                    self.log(
+                        f"[AlterEgo] post_request_hook stored pending from {request_name} (raw response)"
+                    )
+                elif self._try_store_pending_from_message(
+                    self._extract_message_from_update(response)
+                ):
+                    self.log(
+                        f"[AlterEgo] post_request_hook stored pending(message) from {request_name} (raw response)"
+                    )
+        except Exception as hook_error:
+            self.log(f"[AlterEgo] post_request_hook error: {hook_error}")
+        return HookResult(strategy=HookStrategy.DEFAULT, response=response, error=error)
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
         try:
@@ -1705,16 +2845,15 @@ class AlterEgo(BasePlugin):
                 return HookResult(strategy=HookStrategy.CANCEL, params=params)
 
             params_meta = self._extract_send_params_meta(params)
-            dialog_id = self._resolve_dialog_id_from_params_meta(params_meta)
-            if dialog_id and not self._is_dialog_enabled(dialog_id):
+            resolved_dialog_id = self._resolve_dialog_id_from_params_meta(params_meta)
+            if resolved_dialog_id and not self._is_dialog_enabled(resolved_dialog_id):
                 self.log("[AlterEgo] send pipeline: dialog disabled, skip")
                 return HookResult(strategy=HookStrategy.DEFAULT, params=params)
             self._show_bulletin("Маскирую сообщение...", "info")
-            dialog_id = params_meta.get("peer")
 
             def _worker():
                 success, masked_text, error_text = self._process_mask_pipeline(
-                    dialog_id, original_text, api_url
+                    resolved_dialog_id, original_text, api_url
                 )
                 if (
                     not success
@@ -1731,7 +2870,7 @@ class AlterEgo(BasePlugin):
                     return
 
                 cache_key = (
-                    int(dialog_id) if isinstance(dialog_id, int) else 0,
+                    int(resolved_dialog_id) if isinstance(resolved_dialog_id, int) else 0,
                     original_text,
                 )
                 self._mask_cache[cache_key] = masked_text
@@ -1749,6 +2888,7 @@ class AlterEgo(BasePlugin):
                     api_url.rstrip("/"),
                     original_text,
                     params,
+                    resolved_dialog_id,
                 )
 
             run_on_queue(_worker)
@@ -1761,6 +2901,7 @@ class AlterEgo(BasePlugin):
 
     def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
         try:
+            self._try_decode_message_from_update(update, account)
             if not self._pending_stored_messages:
                 return HookResult(strategy=HookStrategy.DEFAULT, update=update)
             if self._try_store_pending_from_update(update, account):
@@ -1769,6 +2910,7 @@ class AlterEgo(BasePlugin):
             message = self._extract_message_from_update(update)
             if self._try_store_pending_from_message(message):
                 self.log("[AlterEgo] on_update_hook: stored by single update")
+            self._decode_message_object_async(update, account)
             return HookResult(strategy=HookStrategy.DEFAULT, update=update)
         except Exception as error:
             self.log(f"[AlterEgo] on_update_hook error: {error}")
@@ -1792,6 +2934,16 @@ class AlterEgo(BasePlugin):
                 self.log(
                     f"[AlterEgo] on_updates_hook: no updates field for container={container_name}"
                 )
+                if self._try_store_pending_from_update(updates, account):
+                    self.log(
+                        f"[AlterEgo] on_updates_hook: stored from container-object {container_name}"
+                    )
+                    return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
+                single_message = self._extract_message_from_update(updates)
+                if self._try_store_pending_from_message(single_message):
+                    self.log(
+                        f"[AlterEgo] on_updates_hook: stored from container-message {container_name}"
+                    )
                 return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
 
             def _iter_items(java_or_py_list):
@@ -1809,6 +2961,7 @@ class AlterEgo(BasePlugin):
             processed = 0
             for update in _iter_items(items):
                 processed += 1
+                self._try_decode_message_from_update(update, account)
                 if self._try_store_pending_from_update(update, account):
                     self.log(
                         f"[AlterEgo] on_updates_hook: stored from raw update container={container_name}, processed={processed}"
@@ -1820,10 +2973,22 @@ class AlterEgo(BasePlugin):
                         f"[AlterEgo] on_updates_hook: stored from container={container_name}, processed={processed}"
                     )
                     break
+                self._decode_message_object_async(update, account)
             else:
-                self.log(
-                    f"[AlterEgo] on_updates_hook: no store match in container={container_name}, processed={processed}"
-                )
+                if processed == 0:
+                    # Some update containers do not expose iterable `updates`, but
+                    # still keep the useful fields on the container itself.
+                    if self._try_store_pending_from_update(updates, account):
+                        self.log(
+                            f"[AlterEgo] on_updates_hook: stored from empty-container-object {container_name}"
+                        )
+                        return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
+                    single_message = self._extract_message_from_update(updates)
+                    if self._try_store_pending_from_message(single_message):
+                        self.log(
+                            f"[AlterEgo] on_updates_hook: stored from empty-container-message {container_name}"
+                        )
+                        return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
 
             return HookResult(strategy=HookStrategy.DEFAULT, updates=updates)
         except Exception as error:
